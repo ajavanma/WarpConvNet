@@ -122,13 +122,25 @@ def prepare_grouped_kernel_map(
     iden_idx = kernel_map.identity_map_index
     num_offsets = len(kernel_map)
 
-    # Compute pair counts for all non-identity offsets
+    # Compute pair counts for all non-identity offsets.
+    #
+    # One vectorised diff + one .tolist() instead of `kernel_volume` separate
+    # `(offsets[k+1] - offsets[k]).item()` calls. IntSearchResult keeps
+    # ``offsets`` on the CPU (see its __init__), so the per-k form was not a D2H
+    # sync -- but it was still kernel_volume (27 for k=3, 125 for k=5) rounds of
+    # 0-dim tensor construction, subtraction and scalar extraction on the host,
+    # in a dispatch path whose cost is pure host time. This is the same "no host
+    # sync in the hot path" discipline mask_gemm.py already documents.
+    _offsets_cpu = kernel_map.offsets
+    if _offsets_cpu.device.type != "cpu":
+        _offsets_cpu = _offsets_cpu.cpu()
+    _counts = (_offsets_cpu[1:] - _offsets_cpu[:-1]).tolist()
     non_iden_indices = []
     non_iden_counts = []
     for k in range(num_offsets):
         if k == iden_idx:
             continue
-        count = (kernel_map.offsets[k + 1] - kernel_map.offsets[k]).item()
+        count = int(_counts[k])
         if count > 0:
             non_iden_indices.append(k)
             non_iden_counts.append(count)

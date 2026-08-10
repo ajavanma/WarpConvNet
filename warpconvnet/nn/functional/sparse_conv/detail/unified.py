@@ -38,8 +38,10 @@ from .autotune import (
     _BENCHMARK_ABT_RESULTS,
     _BENCHMARK_ATB_RESULTS,
     _BENCHMARK_AB_FALLBACK_RESULTS,
+    _BENCHMARK_BWD_FALLBACK_RESULTS,
     _algorithm_filter_key,
     _record_ab_fallback_resolution,
+    _record_bwd_fallback_resolution,
     _serialize_benchmark_results,
     _run_forward_benchmarks,
     _run_backward_benchmarks,
@@ -124,6 +126,11 @@ def _ensure_aligned(t: Optional[Tensor]) -> Optional[Tensor]:
 
 
 _STRIDED_FWD_TILE_IDS = frozenset(range(300, 308))
+
+# Native dgrad pcoff tile ids -- the ONLY tile_ids `_select_dgrad_tile` honours
+# on the native dgrad path (mask_gemm.py:_DGRAD_PCOFF_TILES). Every other
+# plain-"mask_gemm" tile_id resolves to the same channel-ladder kernel.
+_DGRAD_NATIVE_PCOFF_TILES = frozenset({64, 65, 66, 67, 68, 69})
 
 
 def _results_include_tile(results: Any, tile_ids: frozenset[int]) -> bool:
@@ -600,6 +607,31 @@ class UnifiedSpatiallySparseConvFunction(Function):
                 if use_fp16_accum or _allow_small_ch_pcoff_f16_bwd:
                     dgrad_adaptive += list(_AB_MASK_GEMM_FWD_AS_DGRAD_PCOFF_F16ACC)
                     dgrad_adaptive += list(_AB_MASK_GEMM_DGRAD_PCOFF_F16ACC)
+            # Collapse the redundant plain-"mask_gemm" dgrad candidates.
+            #
+            # `_select_dgrad_tile` (mask_gemm.py:611-657) IGNORES params["tile_id"]
+            # on the native dgrad path unless it is one of the native dgrad pcoff
+            # ids 64-69: every other value falls through to a fixed channel ladder
+            # (C<=48 -> 12, C<=96 -> 0/22, else 1/24). So the six AB-pool entries
+            # 41/3/2/58/59/63 all launch ONE kernel.
+            #
+            # Measured on B200, uniform per-batch geometry, N=200000 C=128 kv=27
+            # fp16 dgrad: all six are BIT-IDENTICAL to each other and span
+            # 0.788908 - 0.795662 ms (0.86%, inside the noise floor). Five of the
+            # six are pure cold-autotune cost -- ~5 x (3 warmup + 7 timed + 1
+            # numeric-check capture) x 0.79 ms of wasted sweep per shape.
+            #
+            # `mask_gemm_fwd_as_dgrad` (900-911) and the native pcoff ids are
+            # genuinely distinct kernels and are all kept.
+            _seen_plain_mask = False
+            _deduped = []
+            for _algo, _p in dgrad_adaptive:
+                if _algo == "mask_gemm" and _p.get("tile_id") not in _DGRAD_NATIVE_PCOFF_TILES:
+                    if _seen_plain_mask:
+                        continue
+                    _seen_plain_mask = True
+                _deduped.append((_algo, _p))
+            dgrad_adaptive = _deduped
             return _filter_benchmark_params_by_env_config(
                 dgrad_adaptive, dgrad_filter, is_forward=True
             )
@@ -620,11 +652,41 @@ class UnifiedSpatiallySparseConvFunction(Function):
 
         # Helper to auto-tune one direction. ``build_params`` is a thunk invoked
         # only on a cache miss, so the candidate pool is not built on the warm path.
-        def _autotune_one_direction(cache_dict, cache_ns, needs_grad_tuple, build_params, cfg):
+        #
+        # Filter-aware, mirroring the forward path's three tiers. Before this,
+        # the cache lookup was ``cache_dict.get(cfg)`` alone and ``cfg`` carries
+        # no record of the algorithm filter, so:
+        #   (a) a ``dgrad_algo=``/``wgrad_algo=`` pin was silently IGNORED
+        #       whenever a winner for that shape was already cached (including
+        #       one loaded from disk) -- pinning had no observable effect, which
+        #       is what made cross-process backward timings for "the same
+        #       config" differ by up to 4x depending on which way an earlier
+        #       autotune happened to fall;
+        #   (b) a pinned sweep's winner was written back over the SHARED
+        #       adaptive winner for that shape, so pinning a slow algo once
+        #       poisoned ``auto`` for every later call and for the on-disk cache.
+        def _autotune_one_direction(
+            cache_dict, cache_ns, needs_grad_tuple, build_params, cfg, algo_filter="auto"
+        ):
+            filter_key = _algorithm_filter_key(algo_filter)
+            filter_set = (
+                set(algo_filter) if isinstance(algo_filter, list) else {str(algo_filter)}
+            )
             cached = cache_dict.get(cfg)
-            if cached is not None:
-                best_list = [cached] if isinstance(cached, tuple) else cached
-                return best_list[0][0], best_list[0][1]
+            if filter_key is None:
+                # Adaptive mode: the cached best winner is always valid.
+                if cached is not None:
+                    best_list = [cached] if isinstance(cached, tuple) else cached
+                    return best_list[0][0], best_list[0][1]
+            else:
+                resolved = _BENCHMARK_BWD_FALLBACK_RESULTS.get((cache_ns, cfg, filter_key))
+                if resolved is not None:
+                    return resolved
+                if cached is not None:
+                    best_list = [cached] if isinstance(cached, tuple) else cached
+                    in_filter = [r for r in best_list if r[0] in filter_set]
+                    if in_filter:
+                        return in_filter[0][0], in_filter[0][1]
             results = _run_backward_benchmarks(
                 grad_output,
                 in_features,
@@ -637,13 +699,21 @@ class UnifiedSpatiallySparseConvFunction(Function):
                 needs_input_grad=needs_grad_tuple,
                 groups=groups,
             )
-            cache_dict[cfg] = results
-            generic_benchmark_update_entry(
-                cache_ns,
-                cfg,
-                _serialize_benchmark_results(results),
-                force=False,
-            )
+            if filter_key is None or results[0][0] in filter_set:
+                cache_dict[cfg] = results
+                generic_benchmark_update_entry(
+                    cache_ns,
+                    cfg,
+                    _serialize_benchmark_results(results),
+                    force=False,
+                )
+            else:
+                # Every pinned candidate was rejected and the sweep fell back.
+                # Record the negative resolution so later calls short-circuit,
+                # and do NOT overwrite the shared adaptive winner with it.
+                _record_bwd_fallback_resolution(
+                    cache_ns, cfg, filter_key, results[0][0], results[0][1]
+                )
             return results[0][0], results[0][1]
 
         # Pre-cast tensors once so dgrad and wgrad don't duplicate work.
@@ -686,6 +756,7 @@ class UnifiedSpatiallySparseConvFunction(Function):
                 (True, False),
                 _build_filtered_dgrad_params,
                 dgrad_config,
+                dgrad_filter,
             )
             logger.debug(
                 f"[dispatch] DGRAD algo={dgrad_algo} params={dgrad_params} "
@@ -734,6 +805,7 @@ class UnifiedSpatiallySparseConvFunction(Function):
                 (False, True),
                 _build_filtered_wgrad_params,
                 wgrad_config,
+                wgrad_filter,
             )
             logger.debug(
                 f"[dispatch] WGRAD algo={wgrad_algo} params={wgrad_params} "

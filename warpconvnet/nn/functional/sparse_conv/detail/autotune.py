@@ -169,6 +169,39 @@ _BENCHMARK_AB_FALLBACK_RESULTS: Dict[
 # v16 schema; absent from older caches (they simply behave as a first run).
 _AB_FALLBACK_NAMESPACE = "AB_gather_scatter_fallback"
 
+# Same negative-resolution idea for the BACKWARD directions, keyed by
+# (namespace, config, filter_key). In-memory only: unlike the forward marker it
+# is not persisted, so a pinned filter with no viable candidate re-sweeps once
+# per process instead of once ever. That keeps the on-disk schema untouched.
+#
+# Why it exists at all: `_autotune_one_direction` used to resolve a backward
+# direction purely from `cache_dict.get(cfg)`, and `cfg`
+# (SpatiallySparseConvConfig) carries NO record of the algorithm filter. So on a
+# warm cache -- including one loaded from disk -- `dgrad_algo=`/`wgrad_algo=`
+# pins were silently ignored, and a pinned sweep's winner was written back over
+# the shared adaptive winner for that shape. The forward path has guarded
+# against both since the v16 schema; the backward path did not.
+_BENCHMARK_BWD_FALLBACK_RESULTS: Dict[
+    Tuple[str, SpatiallySparseConvConfig, str],
+    Tuple[str, Dict[str, Any]],
+] = {}
+
+
+def _record_bwd_fallback_resolution(
+    cache_ns: str,
+    config: SpatiallySparseConvConfig,
+    filter_key: str,
+    algo: Any,
+    params: Any,
+) -> None:
+    """Record that a pinned backward filter resolved to an out-of-filter
+    fallback for ``config`` so subsequent calls short-circuit instead of
+    re-sweeping every backward."""
+    _BENCHMARK_BWD_FALLBACK_RESULTS[(cache_ns, config, filter_key)] = (
+        _serialize_algo_value(algo),
+        params if isinstance(params, dict) else {},
+    )
+
 # ---------------------------------------------------------------------------
 # Serialization helpers for cache
 # ---------------------------------------------------------------------------
@@ -440,6 +473,80 @@ def _raise_if_context_poisoned(algo: str, params: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _fp32_reference_operands(*tensors: Optional[Tensor]) -> Optional[Tuple[Optional[Tensor], ...]]:
+    """Upcast the reference operands to fp32, or ``None`` if that would OOM.
+
+    The autotune numeric self-check used to compute its ``explicit_gemm``
+    oracle **at the compute dtype**. That is inverted whenever the operands
+    reach the fp16 denormal band: cuBLAS/CUTLASS flush-to-zero paths collapse
+    the oracle to ~0, so the candidates that flush *agree* with it and the
+    candidates that carry real signal are disqualified for "differing beyond
+    tolerance".
+
+    Measured on B200 (uniform per-batch geometry, N=500k, C=64, kv=27, fp16,
+    grad_output from a ``.pow(2).mean()`` loss, i.e. |g| ~ 5e-8 which is below
+    fp16's smallest normal 6.104e-5): every one of the 14 mask_gemm dgrad
+    candidates was disqualified with ``zero_ratio=1.03e+04`` -- the CANDIDATE
+    was ten thousand times larger than the oracle, not the other way round.
+    The sweep then fell through to ``cutlass_implicit_gemm`` at 5.2599 ms
+    where ``cute_grouped`` runs the same dgrad in 1.5054 ms (3.49x).
+
+    An fp32 oracle is immune: it is computed above the denormal band, so the
+    flushing candidates fail and the accurate ones pass, which is the intended
+    semantics of the guard.
+    """
+    try:
+        # promote_types, not .float(): a float64 gradcheck operand must NOT be
+        # downcast to fp32, or the "oracle" becomes less precise than the
+        # candidates it is judging. fp16/bf16 -> fp32, fp32 -> fp32, fp64 -> fp64.
+        out = tuple(
+            None if t is None else t.to(torch.promote_types(t.dtype, torch.float32))
+            for t in tensors
+        )
+        torch.cuda.synchronize()
+        return out
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as err:  # pragma: no cover - defensive
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        logger.debug(f"fp32 reference operands unavailable ({err}); using compute-dtype reference")
+        return None
+
+
+# The compute dtypes whose denormal band the compute-dtype oracle falls into.
+# For fp32/fp64 compute the oracle is already exact enough and the upcast is a
+# no-op, so the extra reference pass is skipped entirely.
+_REDUCED_PRECISION_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def _reference_overflows_compute_dtype(
+    ref: Optional[Tensor], compute_dtype: Optional[torch.dtype]
+) -> bool:
+    """True when an fp32 oracle holds values the compute dtype cannot represent.
+
+    The pre-existing fail-open for "fp16 wgrad legitimately overflows to inf,
+    so validating against that inf is meaningless" used to trigger because the
+    *reference itself* was computed in fp16 and overflowed. With the fp32 oracle
+    it no longer overflows, so the same situation has to be detected directly:
+    if casting the oracle down to the compute dtype produces a non-finite value,
+    every candidate will legitimately overflow too and the guard cannot
+    discriminate. Underflow is deliberately NOT treated this way -- that is
+    exactly the case the fp32 oracle exists to adjudicate.
+    """
+    if ref is None or compute_dtype is None:
+        return False
+    if compute_dtype in (torch.float32, torch.float64):
+        return False
+    try:
+        rf = ref.float()
+        if not torch.isfinite(rf).all().item():
+            return False  # handled by _reference_has_signal
+        return not torch.isfinite(rf.to(compute_dtype).float()).all().item()
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _reference_has_signal(ref: Optional[Tensor]) -> bool:
     """A reference grad tensor is usable for validation only if it is finite
     and carries nonzero signal.
@@ -625,16 +732,29 @@ def _run_forward_benchmarks(
         )
         return benchmark_forward(algo_mode, ctx)
 
-    def _execute_single_fwd_capture(algo_mode: str, params_config: Dict[str, Any]) -> Tensor:
+    def _execute_single_fwd_capture(
+        algo_mode: str, params_config: Dict[str, Any], fp32: bool = False
+    ) -> Tensor:
         """Same call as ``_execute_single_fwd_pass`` but returns the output
         tensor so the numeric self-check can inspect it. Raises on a non-zero
-        GEMM status."""
+        GEMM status.
+
+        ``fp32=True`` runs the call on fp32 operands so the reference oracle is
+        computed above the denormal band -- see ``_fp32_reference_operands``."""
+        _in, _w = in_features, weight
+        _cdt = compute_dtype
+        if fp32:
+            ops = _fp32_reference_operands(in_features, weight)
+            if ops is None:
+                raise RuntimeError("fp32 reference operands unavailable")
+            _in, _w = ops
+            _cdt = torch.float32
         ctx = FwdCtx(
-            in_features=in_features,
-            weight=weight,
+            in_features=_in,
+            weight=_w,
             kernel_map=kernel_map,
             num_out_coords=num_out_coords,
-            compute_dtype=compute_dtype,
+            compute_dtype=_cdt,
             params=params_config,
             fwd_block_size=None,
             groups=groups,
@@ -697,15 +817,41 @@ def _run_forward_benchmarks(
         if _ref_attempted:
             return _ref_out
         _ref_attempted = True
-        try:
-            ref = _execute_single_fwd_capture("explicit_gemm", {})
-            torch.cuda.synchronize()
-        except Exception as ref_err:  # pragma: no cover - defensive
-            _disable_numeric_check(f"reference (explicit_gemm) failed to run ({ref_err})")
-            return None
+        # fp32 oracle first (immune to the compute-dtype denormal inversion,
+        # see _fp32_reference_operands); compute-dtype oracle only as a fallback
+        # when the upcast cannot be materialised.
+        ref = None
+        _oracle_dtype = compute_dtype if compute_dtype is not None else in_features.dtype
+        if _oracle_dtype in _REDUCED_PRECISION_DTYPES:
+            try:
+                ref = _execute_single_fwd_capture("explicit_gemm", {}, fp32=True)
+                torch.cuda.synchronize()
+            except Exception as fp32_err:  # pragma: no cover - defensive
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                logger.debug(
+                    f"fp32 forward reference failed ({fp32_err}); retrying at compute dtype"
+                )
+        if ref is None:
+            try:
+                ref = _execute_single_fwd_capture("explicit_gemm", {})
+                torch.cuda.synchronize()
+            except Exception as ref_err:  # pragma: no cover - defensive
+                _disable_numeric_check(f"reference (explicit_gemm) failed to run ({ref_err})")
+                return None
         if not _reference_has_signal(ref):
             _disable_numeric_check(
                 "reference output is non-finite or all-zero (e.g. fp16 " "accumulation overflow)"
+            )
+            return None
+        _eff_dtype = compute_dtype if compute_dtype is not None else in_features.dtype
+        if _reference_overflows_compute_dtype(ref, _eff_dtype):
+            _disable_numeric_check(
+                f"reference output is non-finite in {_eff_dtype}: the fp32 oracle "
+                f"holds values {_eff_dtype} cannot represent, so every candidate "
+                f"overflows identically"
             )
             return None
         if _forward_numeric_disqualifies(ref, ref) is not None:
@@ -898,18 +1044,29 @@ def _run_backward_benchmarks(
         return benchmark_backward(algo_mode, ctx)
 
     def _execute_single_bwd_capture(
-        algo_mode: str, params_config: Dict[str, Any]
+        algo_mode: str, params_config: Dict[str, Any], fp32: bool = False
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
         # Same ctx as the benchmarked pass, but return the raw (grad_in,
         # grad_weight) tuple so the numeric self-check can inspect the actual
         # gradients (benchmark_backward discards them, keeping only status).
+        #
+        # ``fp32=True`` runs on fp32 operands so the reference oracle sits above
+        # the denormal band -- see ``_fp32_reference_operands``.
+        _go, _in, _w = grad_output, in_features, weight
+        _cdt = compute_dtype
+        if fp32:
+            ops = _fp32_reference_operands(grad_output, in_features, weight)
+            if ops is None:
+                raise RuntimeError("fp32 reference operands unavailable")
+            _go, _in, _w = ops
+            _cdt = torch.float32
         ctx = BwdCtx(
-            grad_output=grad_output,
-            in_features=in_features,
-            weight=weight,
+            grad_output=_go,
+            in_features=_in,
+            weight=_w,
             kernel_map=kernel_map,
             num_out_coords=num_out_coords,
-            compute_dtype=compute_dtype,
+            compute_dtype=_cdt,
             device=device,
             needs_input_grad=needs_input_grad,
             params=params_config,
@@ -951,13 +1108,31 @@ def _run_backward_benchmarks(
         if _ref_attempted:
             return _ref_grads
         _ref_attempted = True
-        try:
-            ref = _execute_single_bwd_capture("explicit_gemm", {})
-            torch.cuda.synchronize()
-        except Exception as ref_err:  # pragma: no cover - defensive
-            _disable_numeric_check(f"reference (explicit_gemm) failed to run ({ref_err})")
-            _ref_grads = None
-            return None
+        # fp32 oracle first (immune to the compute-dtype denormal inversion,
+        # see _fp32_reference_operands); compute-dtype oracle only as a fallback
+        # when the upcast cannot be materialised.
+        ref = None
+        _oracle_dtype = compute_dtype if compute_dtype is not None else grad_output.dtype
+        if _oracle_dtype in _REDUCED_PRECISION_DTYPES:
+            try:
+                ref = _execute_single_bwd_capture("explicit_gemm", {}, fp32=True)
+                torch.cuda.synchronize()
+            except Exception as fp32_err:  # pragma: no cover - defensive
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                logger.debug(
+                    f"fp32 backward reference failed ({fp32_err}); retrying at compute dtype"
+                )
+        if ref is None:
+            try:
+                ref = _execute_single_bwd_capture("explicit_gemm", {})
+                torch.cuda.synchronize()
+            except Exception as ref_err:  # pragma: no cover - defensive
+                _disable_numeric_check(f"reference (explicit_gemm) failed to run ({ref_err})")
+                _ref_grads = None
+                return None
         # The reference must carry usable (finite, nonzero) signal in at least
         # one requested direction. A non-finite reference — the fp16 wgrad
         # overflow case, where the reference algo overflows to inf identically
@@ -970,6 +1145,17 @@ def _run_backward_benchmarks(
             _disable_numeric_check(
                 "reference gradient is non-finite or all-zero in every checked "
                 "direction (e.g. fp16 accumulation overflow)"
+            )
+            _ref_grads = None
+            return None
+        _eff_dtype = compute_dtype if compute_dtype is not None else grad_output.dtype
+        if _reference_overflows_compute_dtype(ref_in, _eff_dtype) or (
+            _reference_overflows_compute_dtype(ref_w, _eff_dtype)
+        ):
+            _disable_numeric_check(
+                f"reference gradient is non-finite in {_eff_dtype}: the fp32 "
+                f"oracle holds values {_eff_dtype} cannot represent, so every "
+                f"candidate overflows identically"
             )
             _ref_grads = None
             return None

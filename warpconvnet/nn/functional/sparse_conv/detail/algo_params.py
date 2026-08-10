@@ -538,10 +538,21 @@ def _get_adaptive_AB_params(
 
     # ch <= 128: mask wins 90-100% at all N sizes
     # Include cutlass as fallback in case mask fails (e.g., unsupported config)
+    #
+    # B200 (sm_100) addition: ``_AB_CUTE_GROUPED`` is a *fallback*, not a
+    # contender. When every mask candidate is unavailable or disqualified (the
+    # dgrad direction does this whenever the numeric guard fires), the only
+    # survivor here was ``cutlass_implicit_gemm`` -- a 26-launch per-offset
+    # Python loop. Measured on B200, uniform per-batch geometry, N=500k C=64
+    # kv=27 fp16, all 14 mask dgrad candidates disqualified: the surviving pool
+    # picked cutlass_implicit_gemm at 5.2599 ms where cute_grouped runs the same
+    # dgrad in 1.5054 ms (3.49x). At normal gradient scale mask wins outright
+    # and this candidate is never selected, so it costs only autotune time.
     if max_ch <= 128:
         params = []
         params.extend(_ab_prod)
         params.extend(_cutlass)
+        params.extend(_AB_CUTE_GROUPED)
         params.extend(_AB_CUTE_SM90)
         params.extend(_AB_CUTE_GROUPED_SM90)
         return params
@@ -758,10 +769,17 @@ def _get_adaptive_AtB_params(
         return params
 
     # ch > 128: cute_grouped wins 82-100% at all N
+    #
+    # That comment was measured on SM 8.9 and never revalidated on sm_100. On
+    # B200 this is the ONE adaptive-AtB branch that omits
+    # ``cutlass_grouped_hybrid`` (the ``ch 65-128, large N`` branch below already
+    # has it and shows no regression). Adding it only widens the candidate set;
+    # autotune still picks the winner.
     if max_ch > 128:
         params = []
         params.extend(_atb_prod)
         params.extend(_AB_CUTE_GROUPED)
+        params.extend(_cutlass_grp)
         params.extend(_AB_CUTE_SM90)
         params.extend(_AB_CUTE_GROUPED_SM90)
         return params
@@ -789,12 +807,23 @@ def _get_adaptive_AtB_params(
         return params
 
     # ch <= 64, small N: cute_grouped 57%, implicit 29%, mask competitive
+    #
+    # `implicit_gemm` REMOVED from this branch on sm_100. This was the only
+    # adaptive pool it still appeared in (ch<=64 AND N<=16384). Measured on B200,
+    # uniform per-batch geometry, N=14000 B=8 C=64 kv=27 fp16 wgrad, 25 timed
+    # iters, full 18-candidate pool:
+    #     mask_gemm(tile 9, split_k 32)   0.056672 ms   <- winner
+    #     cute_grouped(mma_tile 3)        0.234080 ms   4.13x
+    #     implicit_gemm                   2.973568 ms   52.47x  <- slowest of 18
+    # It can never be selected, so it only costs cold-autotune wall time:
+    # (3 warmup + 7 timed + 1 numeric-check capture) x 2.97 ms ~= 33 ms per shape.
+    # A network with 56-101 narrow layers pays that per distinct shape at startup.
+    # Total-failure coverage is unaffected: _run_backward_benchmarks already falls
+    # back to explicit_gemm when no candidate succeeds.
     if 0 < log_n <= 14:
         params = []
         params.extend(_atb_prod)
         params.extend(_AB_CUTE_GROUPED)
-
-        params.extend(_ATB_IMPLICIT_GEMM)
         params.extend(_AB_CUTE_SM90)
         params.extend(_AB_CUTE_GROUPED_SM90)
         return params

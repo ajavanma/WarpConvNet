@@ -63,10 +63,17 @@ def _get_cached_AB_geometry(
         ]
     ).to(dtype=torch.int32, device=device)
 
-    m_tiles = (group_sizes + tile_m - 1) // tile_m
-    tile_offsets = torch.zeros(len(group_indices) + 1, dtype=torch.int32, device=device)
-    torch.cumsum(m_tiles, dim=0, out=tile_offsets[1:])
-    total_m_tiles = int(tile_offsets[-1])
+    # m_tiles / tile_offsets are derived from CPU-resident `offsets_cpu`, so
+    # build them on the host and ship the finished tensor once. Computing the
+    # cumsum on-device and then reading `int(tile_offsets[-1])` back was a real
+    # D2H sync (the only one in this function) for a value the host already
+    # has all the inputs for.
+    _sizes_cpu = offsets_cpu[group_indices + 1] - offsets_cpu[group_indices]
+    _m_tiles_cpu = (_sizes_cpu.to(torch.int64) + tile_m - 1) // tile_m
+    _tile_offsets_cpu = torch.zeros(len(group_indices) + 1, dtype=torch.int64)
+    torch.cumsum(_m_tiles_cpu, dim=0, out=_tile_offsets_cpu[1:])
+    total_m_tiles = int(_tile_offsets_cpu[-1])
+    tile_offsets = _tile_offsets_cpu.to(dtype=torch.int32, device=device)
 
     group_indices_dev = group_indices.to(dtype=torch.int64, device=device)
 

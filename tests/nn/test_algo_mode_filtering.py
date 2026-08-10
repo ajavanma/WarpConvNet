@@ -119,7 +119,9 @@ class TestAdaptiveForwardParams:
 
     Current gating (SM 8.9 pool): mask_gemm + cutlass_implicit_gemm form the
     always-present core; cutlass_grouped_hybrid is added for max_ch in 129-256;
-    cute_grouped is added only for max_ch > 256.
+    cute_grouped is a contender for max_ch > 256 and a FALLBACK for max_ch <= 128
+    (sm_100: see test_small_channels_include_cute_grouped_fallback). The
+    129..256 band is mask + cutlass only.
     """
 
     def test_core_algos_present_all_channels(self):
@@ -150,12 +152,28 @@ class TestAdaptiveForwardParams:
         algos = {a for a, _ in m["_adaptive_ab"](384, 256, 27)}
         assert "cute_grouped" in algos
 
-    def test_small_channels_exclude_cute_grouped(self):
+    def test_small_channels_include_cute_grouped_fallback(self):
         m = _import()
-        # cute_grouped is gated to max_ch > 256; small channels must not include it.
+        from warpconvnet.nn.functional.sparse_conv.detail.algo_params import (
+            _HAS_CUTE_GROUPED,
+        )
+
+        if not _HAS_CUTE_GROUPED:
+            pytest.skip("cute_grouped backend unavailable")
+        # max_ch <= 128 carries cute_grouped as a FALLBACK (not a contender):
+        # when every mask candidate is disqualified the only survivor used to be
+        # cutlass_implicit_gemm's 26-launch per-offset loop. Measured on B200,
+        # N=500000 C=64 kv=27 fp16 dgrad with all mask candidates rejected:
+        # cutlass_implicit_gemm 5.2599 ms vs cute_grouped 1.5054 ms (3.49x).
         for c_in, c_out in [(32, 32), (64, 128)]:
             algos = {a for a, _ in m["_adaptive_ab"](c_in, c_out, 27)}
-            assert "cute_grouped" not in algos
+            assert "cute_grouped" in algos
+
+    def test_mid_channels_exclude_cute_grouped(self):
+        m = _import()
+        # The 129..256 band is still mask + cutlass only.
+        algos = {a for a, _ in m["_adaptive_ab"](256, 256, 27)}
+        assert "cute_grouped" not in algos
 
     def test_mid_channels_include_cutlass_grouped(self):
         m = _import()

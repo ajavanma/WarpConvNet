@@ -319,6 +319,18 @@ def spatially_sparse_conv(
         if _weight_for_gemm.dtype != effective_compute_dtype:
             _weight_for_gemm = _weight_for_gemm.to(dtype=effective_compute_dtype)
 
+    # NOTE: a kernel_volume == 1 dense-matmul shortcut was deliberately NOT kept
+    # here. The `prod(kernel_size) == 1 and prod(stride) == 1` early return
+    # earlier in this function already claims that case, so a second guard at
+    # this point is unreachable in practice — instrumented across all 2165 tests
+    # in tests/nn, it never fired. It is not strictly dead (a strided ks=1 conv
+    # whose coordinates all survive downsampling would reach it), and in exactly
+    # that case it would bypass UnifiedSpatiallySparseConvFunction and take the
+    # weight gradient from torch.matmul autograd in the compute dtype — undoing
+    # the fp32 wgrad discipline that exists because GradScaler-scaled gradients
+    # overflow fp16's 65504. Unreachable plus a numeric regression where it is
+    # reachable is not a trade worth making; route everything through the fused
+    # path.
     out_feature_tensor = UnifiedSpatiallySparseConvFunction.apply(
         _features_for_gemm,
         _weight_for_gemm,
