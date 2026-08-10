@@ -107,11 +107,16 @@ def sparse_reduce(
         out_features = new_out_features
 
     output_offsets = output_offsets.cpu()
+    out_coords = IntCoords(
+        batch_indexed_out_coords[:, 1:],
+        output_offsets,
+    )
+    # Same handoff as spatially_sparse_conv: the batch-indexed form of these
+    # exact coordinates is already materialised, so give it to the new IntCoords
+    # rather than making the next layer rebuild it.
+    out_coords._set_batch_indexed_coordinates(batch_indexed_out_coords)
     return voxels.replace(
-        batched_coordinates=IntCoords(
-            batch_indexed_out_coords[:, 1:],
-            output_offsets,
-        ),
+        batched_coordinates=out_coords,
         batched_features=out_features,
         stride=out_tensor_stride,
     )

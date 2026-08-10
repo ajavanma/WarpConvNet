@@ -159,10 +159,9 @@ def _pool_by_max_num_points(
     if len(unique_indices) != len(sample_idx):
         # select survived indices
         sampled_coords = sampled_coords[unique_indices]
-        unique_batch_indices = batch_index_from_offset(sampled_offsets)
-        unique_batch_indices = unique_batch_indices.to(unique_indices.device)[
-            unique_indices
-        ]
+        unique_batch_indices = batch_index_from_offset(
+            sampled_offsets, device=unique_indices.device
+        )[unique_indices]
         _, unique_counts = torch.unique_consecutive(
             unique_batch_indices, return_counts=True
         )

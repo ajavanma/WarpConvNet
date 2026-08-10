@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 from jaxtyping import Float, Int
 
 import numpy as np
@@ -17,16 +17,35 @@ import warpconvnet._C as _C
 @torch.inference_mode()
 def batch_index_from_offset(
     offsets: Int[Tensor, "B+1"],
+    device: Optional[Union[str, torch.device]] = None,
 ) -> Int[Tensor, "N"]:  # type: ignore
     """
     Generates batch indices for a contiguous range of elements defined by offsets.
     `offsets` has B+1 elements, defining B batches.
     Output has N = offsets[B] elements.
+
+    Args:
+        offsets: B+1 boundary offsets.
+        device: Device to build the result on. Defaults to ``offsets.device``
+            (usually the CPU, per the ``BatchedTensor`` contract). Callers that
+            immediately move the result to the GPU should pass the target device
+            instead: the CPU ``repeat_interleave`` opens an OpenMP parallel
+            region for every ``B > 1`` (``native/Repeat.cpp::compute_cpu`` ->
+            ``at::parallel_for(..., grain_size=1)`` over B), which in a
+            thread-oversubscribed container costs tens of milliseconds of pure
+            host stall. See ``batch_indexed_coordinates`` for the measurements.
     """
     assert len(offsets) > 1, "offsets must have at least two elements. [0, N] for batch size 1"
-    count = torch.diff(offsets)
-    batch = torch.arange(len(count), device=offsets.device, dtype=torch.long).repeat_interleave(
-        count
+    if device is None:
+        device = offsets.device
+    # Read the output size off the *source* offsets while they are still on the
+    # host: free there, a device sync once they have been moved. Without it the
+    # CUDA repeat_interleave sizes its output with cumsum[-1].item().
+    out_size = int(offsets[-1]) if offsets.device.type == "cpu" else None
+    offsets = offsets.to(device=device, dtype=torch.long)
+    count = offsets[1:] - offsets[:-1]
+    batch = torch.arange(len(count), device=device, dtype=torch.long).repeat_interleave(
+        count, output_size=out_size
     )
     return batch
 
@@ -91,9 +110,58 @@ def batch_indexed_coordinates(
     batched_coords: Float[Tensor, "N 3"],  # noqa: F821
     offsets: Int[Tensor, "B + 1"],  # noqa: F821
 ) -> Float[Tensor, "N 4"]:  # noqa: F821
-    batch_index = batch_index_from_offset(offsets).to(batched_coords)
-    batched_coords = torch.cat([batch_index.unsqueeze(1), batched_coords], dim=1)
-    return batched_coords
+    """Prepend the batch index column to ``batched_coords``.
+
+    Value-identical to ``cat([batch_index_from_offset(offsets), batched_coords], 1)``
+    but materialises the batch column on ``batched_coords.device``.
+
+    Why: ``offsets`` lives on the CPU by the ``BatchedTensor`` contract, so the
+    stock formulation ran ``torch.repeat_interleave`` on the **CPU**. ATen's CPU
+    kernel (``native/Repeat.cpp::compute_cpu``) calls ``at::parallel_for`` with
+    ``grain_size=1`` over ``numel(repeats) == B``: for ``B == 1`` that takes the
+    serial path, for every ``B > 1`` it opens an OpenMP parallel region and forks
+    ``torch.get_num_threads()`` OS threads. Inside a CPU-limited container
+    (measured: 144 threads over a 16-CPU cgroup quota) that fork/join storm
+    descheduled the host thread and starved the CUDA driver, making a
+    ``SparseConv3d`` call jump from 2.717 ms at B=1 to 80.637 ms at B=2 --- a
+    30x cliff that is purely host-side (the GPU sat idle). Building the column
+    on the GPU removes the CPU parallel region entirely.
+
+    ``output_size=`` is load-bearing: without it the CUDA ``repeat_interleave``
+    does ``cumsum[-1].item()`` to size its output, which is a device sync.
+    """
+    assert len(offsets) > 1, "offsets must have at least two elements. [0, N] for batch size 1"
+    device = batched_coords.device
+    num_points = batched_coords.shape[0]
+    num_batches = len(offsets) - 1
+
+    # Validate BEFORE dispatching to repeat_interleave. `output_size=` is a
+    # promise to the CUDA kernel: if it disagrees with cumsum(counts)[-1] the
+    # kernel raises a DEVICE-SIDE ASSERT, which kills the CUDA context for the
+    # rest of the process and misattributes itself to whatever runs next. Stock
+    # raised a clean, recoverable RuntimeError here, so the check keeps the
+    # failure mode a host-side error at the actual call site.
+    if offsets.device.type == "cpu":
+        assert (
+            int(offsets[-1]) == num_points
+        ), f"Offsets {offsets} does not match the number of points {num_points}"
+
+    if num_batches == 1:
+        # Every row belongs to batch 0. Skips the repeat_interleave and the
+        # offsets host-to-device copy altogether.
+        batch_index = torch.zeros(
+            (num_points, 1), dtype=batched_coords.dtype, device=device
+        )
+    else:
+        offsets_dev = offsets.to(device=device, dtype=torch.long)
+        counts = offsets_dev[1:] - offsets_dev[:-1]
+        batch_index = (
+            torch.arange(num_batches, device=device, dtype=torch.long)
+            .repeat_interleave(counts, output_size=num_points)
+            .to(batched_coords)
+            .unsqueeze(1)
+        )
+    return torch.cat([batch_index, batched_coords], dim=1)
 
 
 @torch.inference_mode()

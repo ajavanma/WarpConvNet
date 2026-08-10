@@ -139,6 +139,12 @@ class Geometry:
 
     @property
     def batch_indexed_coordinates(self) -> Tensor:
+        # Delegate to the Coords property so the memo (see
+        # warpconvnet.geometry.base.coords.Coords) is shared rather than
+        # rebuilding an identical [N, D+1] tensor on every access.
+        coords = self.batched_coordinates
+        if isinstance(coords, Coords):
+            return coords.batch_indexed_coordinates
         return batch_indexed_coordinates(self.coordinate_tensor, self.offsets)
 
     @property

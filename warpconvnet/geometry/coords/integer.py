@@ -116,7 +116,9 @@ class IntCoords(Coords):
             mask = mask.bool()
 
         # Get original batch indices
-        batch_indices = batch_index_from_offset(self.offsets).to(self.batched_tensor.device)
+        batch_indices = batch_index_from_offset(
+            self.offsets, device=self.batched_tensor.device
+        )
 
         # Filter tensor and batch indices
         new_tensor = self.batched_tensor[mask]

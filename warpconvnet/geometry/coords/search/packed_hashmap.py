@@ -69,15 +69,22 @@ class PackedHashTable(PackedHashTableBase):
         if coords.shape[0] > 0:
             batch = coords[:, 0]
             spatial = coords[:, 1:]
-            if batch.min().item() < 0 or batch.max().item() > self.BATCH_MAX:
+            # Same four range checks as before, but one device->host round trip
+            # instead of four: every `.item()` blocks on the stream, and these
+            # were 0.108 ms of the 0.201 ms per-cold-build sync budget measured
+            # at N=14000 on a B200.
+            batch_min, batch_max, spatial_min, spatial_max = torch.stack(
+                (batch.min(), batch.max(), spatial.min(), spatial.max())
+            ).tolist()
+            if batch_min < 0 or batch_max > self.BATCH_MAX:
                 raise ValueError(
                     f"Batch index out of range [0, {self.BATCH_MAX}]: "
-                    f"got [{batch.min().item()}, {batch.max().item()}]"
+                    f"got [{batch_min}, {batch_max}]"
                 )
-            if spatial.min().item() < self.COORD_MIN or spatial.max().item() > self.COORD_MAX:
+            if spatial_min < self.COORD_MIN or spatial_max > self.COORD_MAX:
                 raise ValueError(
                     f"Spatial coord out of range [{self.COORD_MIN}, {self.COORD_MAX}]: "
-                    f"got [{spatial.min().item()}, {spatial.max().item()}]"
+                    f"got [{spatial_min}, {spatial_max}]"
                 )
         return coords
 
