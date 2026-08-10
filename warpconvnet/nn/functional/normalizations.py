@@ -17,7 +17,7 @@ import torch
 from torch import Tensor
 from torch.autograd import Function
 
-from torch_scatter import segment_csr
+from warpconvnet.utils.optional_deps import segment_csr  # optional extra; see that module
 import warpconvnet._C as _C
 
 

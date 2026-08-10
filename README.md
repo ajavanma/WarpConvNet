@@ -230,6 +230,19 @@ pip install build ninja
 MAX_JOBS=4 NVCC_THREADS=1 pip install warpconvnet
 ```
 
+Optional extras, not installed by the line above because each compiles against
+your exact torch build and would slow every install:
+
+```bash
+# Needed by the segmented reductions (segmented_layer_norm, segmented_range_norm,
+# global pooling). WarpConvNet imports and runs without it; those functions raise
+# an ImportError naming this command if you call them.
+pip install git+https://github.com/rusty1s/pytorch_scatter.git
+
+# Needed by the flash-attention paths only.
+pip install flash-attn --no-build-isolation
+```
+
 ### Install from source (development)
 
 ```bash

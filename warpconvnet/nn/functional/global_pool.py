@@ -6,7 +6,7 @@ from jaxtyping import Float
 
 import torch
 from torch import Tensor
-from torch_scatter import segment_csr
+from warpconvnet.utils.optional_deps import segment_csr  # optional extra; see that module
 
 from warpconvnet.geometry.base.geometry import Geometry
 from warpconvnet.geometry.types.points import Points

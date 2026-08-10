@@ -7,7 +7,7 @@ from typing import Literal, Tuple
 import torch
 from jaxtyping import Float, Int
 from torch import Tensor
-from torch_scatter import segment_csr
+from warpconvnet.utils.optional_deps import segment_csr  # optional extra; see that module
 
 
 class REDUCTIONS(Enum):
