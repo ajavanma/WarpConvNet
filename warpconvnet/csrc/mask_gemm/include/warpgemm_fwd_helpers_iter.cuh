@@ -457,18 +457,7 @@ __device__ void _load_A_identity(const ElementInput *ptr_A,
                                  int N_in,
                                  int C_in,
                                  int stride_A) const {
-  constexpr int k_iters = tK;        // one K-row per iteration
-  constexpr int m_vecs = tM / kVec;  // kVec M-elements per vector
-  constexpr int total_vecs = k_iters * m_vecs;
-  CUTLASS_PRAGMA_UNROLL
-  for (int idx = threadIdx.x; idx < total_vecs; idx += MaxThreadsPerBlock) {
-    int k_local = idx / m_vecs;
-    int mv = idx % m_vecs;
-    int m_local = mv * kVec;
-    int k_global = k_start + k_local;
-    int in_row = real_rows[mv];  // identity: one real_row per kVec M-rows
-  }
-  // Reuse the exact same iteration as gathered_a but with in_row = real_rows[m]
+  // Same iteration as gathered_a, but with in_row = real_rows[m].
   {
     // Group-conv alignment: cp.async.v4 needs 16-byte aligned source.
     // Misaligned when groups>1 AND per-group C_in not multiple of kVec.

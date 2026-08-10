@@ -1110,7 +1110,7 @@ int mask_gemm_fwd(torch::Tensor input,
 
 #if defined(WARPCONVNET_SM100_ENABLED)
   // Blackwell (sm_100) deep, cross-offset-persistent forward pipeline.
-  // Hand-written; see csrc/mask_gemm/include/MaskGemm_forward_sm100_deep_pipe.h.
+  // Hand-written; see csrc/mask_gemm/include/wcn_sm100_deep_pipe.h.
   // MaskWords=1 only (K <= 32) — the flattened offset walk keeps its cursor in
   // registers, which only holds for a single mask word.
   //   1000 : 64x64x32  NumStages=6    1001 : 64x128x32 NumStages=6

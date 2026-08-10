@@ -10,7 +10,7 @@ two-line hook::
     params.extend(_AB_MASK_SM100)
 
 The tiles are ``MaskGemm_forward_sm100_deep_pipe`` (hand-written, see
-``csrc/mask_gemm/include/MaskGemm_forward_sm100_deep_pipe.h``). They differ from
+``csrc/mask_gemm/include/wcn_sm100_deep_pipe.h``). They differ from
 the incumbent forward tiles in exactly one way: the (kernel offset, k-tile)
 product is flattened into ONE cp.async pipeline, so the pipeline fills and
 drains once per output tile instead of once per active kernel offset, and the

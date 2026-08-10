@@ -22,8 +22,43 @@ from warpconvnet.csrc.mask_gemm.tile_metadata import (
     build_tile_metadata,
     get_schema_version,
 )
+from .tile_metadata_sm100 import SM100_OVERLAY_TILES
 
 _MIN_SCHEMA_VERSION = 7
+
+
+def _build_tiles(*, active_only: bool, ops: Iterable[str] | None = None):
+    """``build_tile_metadata`` plus the wcn-owned sm_100 deep-pipe overlay.
+
+    Forward ids 1000-1009 are hand-written kernels warpgemm does not generate and
+    has reserved to warpconvnet (see ``tile_metadata_sm100``). Every read of the
+    tile registry goes through here so the overlay cannot be half-applied — the
+    previous arrangement patched them into the generated file, where a regen
+    silently dropped them.
+
+    Overlay rows are appended, never merged over an existing id: warpgemm reserves
+    1000-1049 and guards it, so a collision means that contract broke and should
+    surface loudly rather than be papered over.
+    """
+    tiles = build_tile_metadata(active_only=active_only, ops=ops)
+    overlay = SM100_OVERLAY_TILES
+    if active_only:
+        overlay = [t for t in overlay if t.tier == "production"]
+    if ops is not None:
+        wanted = set(ops)
+        overlay = [t for t in overlay if t.op in wanted]
+    if not overlay:
+        return tiles
+    collisions = {t.tile_id for t in tiles} & {t.tile_id for t in overlay}
+    if collisions:
+        raise RuntimeError(
+            f"sm_100 overlay tile ids {sorted(collisions)} are also present in the "
+            "warpgemm-generated metadata. warpgemm reserves forward 1000-1049 to "
+            "warpconvnet; a collision means that reservation was violated. Re-run "
+            "WARPGEMM_REGEN=1 against a warpgemm that vacates the range."
+        )
+    return tiles + overlay
+
 
 # Backends this build can actually launch. The sm100_umma backend is a
 # compile-parseable scaffold in warpgemm with no launchable pipeline; it must
@@ -163,7 +198,7 @@ def _raw_index(op: str) -> dict[int, object]:
     """Uncorrected full-registry index for ``op`` (sibling source for overrides)."""
     idx = _RAW_INDEX.get(op)
     if idx is None:
-        idx = {t.tile_id: t for t in build_tile_metadata(active_only=False, ops=(op,))}
+        idx = {t.tile_id: t for t in _build_tiles(active_only=False, ops=(op,))}
         _RAW_INDEX[op] = idx
     return idx
 
@@ -200,7 +235,7 @@ def _get_tiles(op: str, filter_arch: bool = True):
         )
     tiles = [
         _corrected(op, t)
-        for t in build_tile_metadata(active_only=True, ops=(op,))
+        for t in _build_tiles(active_only=True, ops=(op,))
         if t.backend in _LAUNCHABLE_BACKENDS
     ]
     if not filter_arch:

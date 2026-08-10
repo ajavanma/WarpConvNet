@@ -16,7 +16,7 @@
 
 #include "include/mask_gemm_sm100_launch.h"
 #include "include/wcn_sm100_tiles.h"
-#include "mask_gemm/include/MaskGemm_forward_sm100_deep_pipe.h"
+#include "mask_gemm/include/wcn_sm100_deep_pipe.h"
 
 namespace warpconvnet {
 namespace cute_gemm {

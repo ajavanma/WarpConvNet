@@ -184,7 +184,14 @@ WARPCONVNET_BENCHMARK_CACHE_DIR = _get_env_string(
 # before the forward numeric self-check existed may be poisoned (tile 41
 # was the cached C=32 forward winner); force every config back through
 # the guarded sweeps.
-WARPCONVNET_BENCHMARK_CACHE_VERSION = 17.0
+# 17.0: claimed twice, independently, for two different invalidations that
+# were developed in parallel and met at this merge -- (a) backward rankings
+# contaminated by the dgrad tensor_c/tensor_d aliasing fix, and (b) the
+# sm_100 deep-pipe forward tiles 1000-1009 entering the AB pool. A cache
+# written by either parent is stamped 17.0 while satisfying only its own
+# half, so neither can be trusted here.
+# 18.0: one bump that subsumes both. Do not lower it back to 17.0.
+WARPCONVNET_BENCHMARK_CACHE_VERSION = 18.0
 
 # Additional cache directory for explicit override (useful for debugging multi-GPU issues)
 # If set, this takes precedence over the default cache directory

@@ -123,10 +123,31 @@ enum class FwdTile : int {
   _64x64x32_1s_flat_sab_se_MW8 = 502,
   _64x128x32_1s_flat_MW12 = 503,
   _64x64x32_1s_flat_sab_se_MW12 = 504,
-  _MaskGemm_sm100_umma_forward_64x64x64_3s_f32 = 1000,   // experimental
-  _MaskGemm_sm100_umma_forward_64x128x64_3s_f32 = 1001,  // experimental
+  _MaskGemm_sm100_umma_forward_64x64x64_3s_f32 = 1050,   // experimental
+  _MaskGemm_sm100_umma_forward_64x128x64_3s_f32 = 1051,  // experimental
   _64x64x32_2s_v2000 = 2000,                             // experimental
   _64x128x32_2s_v2001 = 2001,                            // experimental
+  _64x64x32_1s_flat_F16Accum_v2010 = 2010,               // experimental
+  _64x64x32_2s_fused_F16Accum_v2011 = 2011,              // experimental
+  _64x128x32_2s_fused_F16Accum_v2012 = 2012,             // experimental
+  _128x64x32_2s_fused_F16Accum = 2013,                   // experimental
+  _64x64x32_2s_pcoff = 2020,                             // experimental
+  _64x64x32_2s_flat_rawmma = 2021,                       // experimental
+  _64x64x32_2s_flat_rawmma_pcoff = 2022,                 // experimental
+  _64x128x32_2s_pcoff = 2023,                            // experimental
+  _64x128x32_2s_flat_rawmma = 2024,                      // experimental
+  _64x128x32_2s_flat_rawmma_pcoff = 2025,                // experimental
+  _128x64x32_2s_pcoff = 2026,                            // experimental
+  _128x64x32_2s_flat_rawmma = 2027,                      // experimental
+  _128x64x32_2s_flat_rawmma_pcoff = 2028,                // experimental
+  _64x64x64_2s = 2030,                                   // experimental
+  _64x128x64_2s = 2031,                                  // experimental
+  _64x64x32_1s_flat_bulkb = 2040,                        // experimental
+  _64x128x32_1s_flat_bulkb = 2041,                       // experimental
+  _128x64x32_1s_flat_bulkb = 2042,                       // experimental
+  _64x64x32_2s_pipelined_bulkb = 2043,                   // experimental
+  _64x128x32_2s_pipelined_bulkb = 2044,                  // experimental
+  _128x64x32_2s_pipelined_bulkb = 2045,                  // experimental
 };
 
 enum class DgradTile : int {
@@ -201,6 +222,22 @@ enum class DgradTile : int {
   _MaskGemm_sm100_umma_dgrad_64x128x64_3s_f32 = 1101,  // experimental
   _64x64x32_2s_pipelined_v2100 = 2100,                 // experimental
   _64x128x32_2s_pipelined_v2101 = 2101,                // experimental
+  _64x64x32_1s_flat_F16Accum_v2110 = 2110,             // experimental
+  _64x128x32_1s_flat_F16Accum_v2111 = 2111,            // experimental
+  _64x128x32_2s_F16Accum_v2112 = 2112,                 // experimental
+  _128x64x32_2s_pipelined_F16Accum = 2113,             // experimental
+  _64x64x32_2s_pcoff = 2120,                           // experimental
+  _64x128x32_2s_pcoff = 2121,                          // experimental
+  _128x64x32_2s_pcoff = 2122,                          // experimental
+  _64x64x64_2s = 2130,                                 // experimental
+  _64x64x64_3s = 2131,                                 // experimental
+  _64x128x64_2s = 2132,                                // experimental
+  _64x64x32_1s_flat_bulkb = 2140,                      // experimental
+  _64x128x32_1s_flat_bulkb = 2141,                     // experimental
+  _128x64x32_1s_flat_bulkb = 2142,                     // experimental
+  _64x64x32_2s_pipelined_bulkb = 2143,                 // experimental
+  _64x128x32_2s_pipelined_bulkb = 2144,                // experimental
+  _128x64x32_2s_pipelined_bulkb = 2145,                // experimental
 };
 
 enum class WgradTile : int {
@@ -231,6 +268,10 @@ enum class WgradTile : int {
   _128x64x32_3s_compact_segment_f32_workspace = 111,         // experimental
   _MaskGemm_sm100_umma_wgrad_64x64x64_3s_f32_atomic = 1200,  // experimental
   _64x64x32_2s_f32_atomic_v2200 = 2200,                      // experimental
+  _64x64x64_2s_f32_atomic = 2210,                            // experimental
+  _64x64x64_3s_f32_atomic = 2211,                            // experimental
+  _64x64x64_2s_f32_workspace = 2212,                         // experimental
+  _64x64x64_3s_f32_workspace = 2213,                         // experimental
 };
 
 }  // namespace gemm
