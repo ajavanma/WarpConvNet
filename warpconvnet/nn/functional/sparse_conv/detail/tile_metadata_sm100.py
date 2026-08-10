@@ -38,7 +38,31 @@ untouched and must stay non-launchable.
 
 All ten are ``tier="experimental"``, so ``build_tile_metadata(active_only=True)``
 excludes them from ordinary dispatch pools; they are reached through the
-override pools in ``algo_params_sm100.py``.
+override pools in ``algo_params_sm100.py``. Do NOT use ``_get_tiles`` to ask
+whether one of these is usable — it filters to ``tier="production"`` and will
+report all ten as absent on the very arch they are pinned to. The authority is
+``tile_launch_rejection``.
+
+Two structural properties, both measured on a GB200 (sm_100) rather than argued:
+
+* **Tile 1009 cannot enter the partial-prolog path in any admissible
+  configuration.** That path needs ``num_k_tiles * num_active < NumStages - 1``.
+  At NS=3 and the minimum admissible ``C_in=64`` (``num_k_tiles=2``) it requires
+  ``num_active <= 0`` — no active offsets, i.e. no work at all. Reaching it at
+  NS=3 needs ``num_k_tiles == 1``, i.e. ``C_in <= 32``, which this tile declares
+  inadmissible. So the shallowest pooled tile is structurally immune to the path,
+  and a validator reporting it as "not exercised" is describing arithmetic, not a
+  coverage gap — there is no input to go looking for.
+* **``num_k_tiles == 1`` ran clean.** Tile 1004 (NS=10, nine offsets in flight)
+  pinned at ``C_in=32`` produced bit-exact output (``max_rel=0``) with
+  ``compute-sanitizer racecheck`` reporting 0 hazards / 0 warnings / 0 skipped.
+  That is the configuration warpgemm ``2819c2f`` deleted from the generated
+  mainloops, on the arch where it records the hazard as *numerically latent* — so
+  racecheck, not numerics, was the test that could have falsified the
+  barrier-epoch argument in the kernel header. One clean run is evidence, not a
+  guarantee: the shape remains reachable only by an explicit pin or a stale
+  autotune cache entry, and a ``TORCH_CHECK(C_in >= 64)`` at the binding is still
+  the right guard.
 """
 
 from __future__ import annotations
