@@ -19,11 +19,20 @@ from warpconvnet.nn.functional.sparse_conv.detail.mask_gemm import (
     _require_launchable,
 )
 
+# Forward ids 1000-1005 NO LONGER hold the sm100_umma scaffold: they were
+# repurposed for the hand-written deep, cross-offset-persistent cp.async
+# pipeline (MaskGemm_forward_sm100_deep_pipe), whose backend really is
+# mma_sync and which IS launchable — but only on sm_100, hence
+# compile_archs=(100,). The dgrad/wgrad scaffold ids are untouched and must
+# still never be selected.
 _SM100_SCAFFOLD = {
-    "forward": (1000, 1001),
     "dgrad": (1100, 1101),
     "wgrad": (1200,),
 }
+# All ten. 1006-1009 are the OCCUPANCY-tuned variants and are the ones the
+# autotuner actually pools (see detail/algo_params_sm100.py), so leaving them
+# out of the authorization coverage was the wrong half to omit.
+_SM100_DEEP_PIPE_FWD = (1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009)
 _SM120_EXPERIMENTAL = {
     "forward": (2000, 2001),
     "dgrad": (2100, 2101),
@@ -49,6 +58,19 @@ def test_active_tiles_never_include_sm100_umma():
     for op in ("forward", "dgrad", "wgrad"):
         backends = {t.backend for t in tm._get_tiles(op, filter_arch=False)}
         assert backends <= tm._LAUNCHABLE_BACKENDS
+
+
+def test_sm100_deep_pipe_fwd_launchable_only_on_sm100(force_arch):
+    """The repurposed forward ids are a real kernel pinned to sm_100."""
+    force_arch(100)
+    for tid in _SM100_DEEP_PIPE_FWD:
+        assert tm.tile_launch_rejection("forward", tid) is None
+    # A single-entry compile_archs is an exact pin, so no other arch inherits
+    # it — not even the binary-compatible sm_103.
+    for arch in (89, 90, 103, 120, 121):
+        force_arch(arch)
+        for tid in _SM100_DEEP_PIPE_FWD:
+            assert tm.tile_launch_rejection("forward", tid) is not None
 
 
 def test_sm100_scaffold_rejected_regardless_of_arch(force_arch):
@@ -165,7 +187,7 @@ def test_foreign_id_rejected():
 
 def test_require_launchable_raises_for_pinned_sm100():
     with pytest.raises(RuntimeError, match="sm100_umma"):
-        _require_launchable("forward", 1000, _METADATA_ABSENT_FWD_LAUNCH_IDS)
+        _require_launchable("dgrad", 1100, _METADATA_ABSENT_DGRAD_LAUNCH_IDS)
     with pytest.raises(RuntimeError, match="sm100_umma"):
         _require_launchable("wgrad", 1200, _METADATA_ABSENT_WGRAD_LAUNCH_IDS)
 
@@ -183,7 +205,12 @@ def test_candidate_pool_excludes_experimental_by_default():
     ids = {t.tile_id for t in tm.candidate_tiles("forward", 128, 128, 27)}
     assert ids
     assert not ids & set(_SM120_EXPERIMENTAL["forward"])
-    assert not ids & set(_SM100_SCAFFOLD["forward"])
+    # _SM100_SCAFFOLD has no "forward" key any more: ids 1000-1009 were
+    # repurposed from the dead sm100_umma scaffold into the real deep-pipe
+    # forward tiles, which ARE launchable on sm_100. The dgrad/wgrad scaffold
+    # ids stay dead and must never be reachable from a forward pool.
+    assert not ids & set(_SM100_SCAFFOLD["dgrad"])
+    assert not ids & set(_SM100_SCAFFOLD["wgrad"])
 
 
 def test_cache_version_invalidates_pre_blackwell_records():

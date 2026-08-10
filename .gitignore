@@ -36,3 +36,6 @@ notes/
 
 # Auto-generated at build time
 warpconvnet/_version.py
+
+# compiled extension — must never be committed (an 87 MB _C.so was, once)
+warpconvnet/_C*.so

@@ -13,6 +13,8 @@
 
 #include "../include/gemm_error_codes.h"
 #include "../include/gemm_mma_tiles.h"        // canonical tile_tag struct decls
+#include "../include/mask_gemm_sm100_launch.h"  // Blackwell deep-pipe fwd tiles (1000-1009)
+#include "../include/wcn_sm100_tiles.h"       // wcn-only Tile64x128x32_8W tag + config
 #include "../include/mask_gemm_tile_enums.h"  // FwdTile/DgradTile/WgradTile (warpgemm-emitted)
 #include "../include/wcn_pcoff_tiles.h"       // wcn-only Pcoff_* tile tags + CuteTileConfig specs
 #include "cutlass/numeric_types.h"
@@ -1106,6 +1108,72 @@ int mask_gemm_fwd(torch::Tensor input,
           [](auto &&...a) { return cute_gemm::launch_mask_gemm_fwd_f32out_sb_mw<In, 12>(a...); }, \
           args))
 
+#if defined(WARPCONVNET_SM100_ENABLED)
+  // Blackwell (sm_100) deep, cross-offset-persistent forward pipeline.
+  // Hand-written; see csrc/mask_gemm/include/MaskGemm_forward_sm100_deep_pipe.h.
+  // MaskWords=1 only (K <= 32) — the flattened offset walk keeps its cursor in
+  // registers, which only holds for a single mask word.
+  //   1000 : 64x64x32  NumStages=6    1001 : 64x128x32 NumStages=6
+  //   1002 : 64x128x32 NumStages=4    1003 : 64x128x32 NumStages=8
+  //   1004 : 64x64x32  NumStages=10  1005 : 64x128x32 NumStages=6, 8 warps
+  // Iteration-2 occupancy pivot (measured blocks/SM was the ordering variable,
+  // not pipeline depth): same mainloop, __launch_bounds__ minBlocks raised.
+  //   1006 : 64x128x32 4s minBlocks=3   1007 : 64x64x32  4s minBlocks=4
+  //   1008 : 64x64x32  4s minBlocks=3   1009 : 64x128x32 3s minBlocks=3
+  if (tile >= 1000 && tile <= 1009) {
+    TORCH_CHECK(mask_words <= 1,
+                "mask_gemm_fwd tile ",
+                tile,
+                " (sm100 deep-pipe) is MaskWords=1 only; got mask_words=",
+                mask_words);
+#define SM100_DEEP_CALL(In, TileTag, Stages, MinBlk)                            \
+  std::apply(                                                                   \
+      [](auto &&...a) {                                                         \
+        return cute_gemm::launch_mask_gemm_fwd_sm100_deep<In,                   \
+                                                          gemm::TileTag,        \
+                                                          In,                   \
+                                                          Stages,               \
+                                                          MinBlk>(a...);        \
+      },                                                                        \
+      args)
+#define SM100_DEEP_SWITCH(In)                              \
+  switch (tile) {                                          \
+    case 1000:                                             \
+      return SM100_DEEP_CALL(In, Tile64x64x32, 6, 1);      \
+    case 1001:                                             \
+      return SM100_DEEP_CALL(In, Tile64x128x32, 6, 1);     \
+    case 1002:                                             \
+      return SM100_DEEP_CALL(In, Tile64x128x32, 4, 1);     \
+    case 1003:                                             \
+      return SM100_DEEP_CALL(In, Tile64x128x32, 8, 1);     \
+    case 1004:                                             \
+      return SM100_DEEP_CALL(In, Tile64x64x32, 10, 1);     \
+    case 1005:                                             \
+      return SM100_DEEP_CALL(In, Tile64x128x32_8W, 6, 1);  \
+    case 1006:                                             \
+      return SM100_DEEP_CALL(In, Tile64x128x32, 4, 3);     \
+    case 1007:                                             \
+      return SM100_DEEP_CALL(In, Tile64x64x32, 4, 4);      \
+    case 1008:                                             \
+      return SM100_DEEP_CALL(In, Tile64x64x32, 4, 3);      \
+    case 1009:                                             \
+      return SM100_DEEP_CALL(In, Tile64x128x32, 3, 3);     \
+    default:                                               \
+      break;                                               \
+  }
+    if (si == torch::kFloat16 && so == torch::kFloat16) {
+      SM100_DEEP_SWITCH(cutlass::half_t);
+    }
+#ifndef DISABLE_BFLOAT16
+    if (si == torch::kBFloat16 && so == torch::kBFloat16) {
+      SM100_DEEP_SWITCH(cutlass::bfloat16_t);
+    }
+#endif
+#undef SM100_DEEP_SWITCH
+#undef SM100_DEEP_CALL
+  }
+#endif  // WARPCONVNET_SM100_ENABLED
+
   // wcn-only fwd f32-output tiles (no canonical equivalent):
   //   80 = aligned f32-output, 82 = scalar-B f32-output
   if (tile == 80 || tile == 82) {
@@ -2167,6 +2235,80 @@ void register_mask_gemm(py::module &m) {
       "Full wcn dispatch truth table: every launchable (op, tile_id) arm -> the "
       "kernel struct it actually launches, per mask_words range, with a note "
       "documenting any deviation from canonical metadata.");
+
+  // -- sm100 deep-pipe introspection. ncu is unusable in the training
+  //    container (ERR_NVGPUCTRPERM), so occupancy has to come from the
+  //    driver API rather than a profiler.
+  prod.def(
+      "sm100_deep_info",
+      [](int tile_id, const std::string &dtype) {
+        py::dict d;
+        d["tile_id"] = tile_id;
+        d["smem_bytes"] = -1;
+        d["max_active_blocks_per_sm"] = -1;
+#if defined(WARPCONVNET_SM100_ENABLED)
+        bool is_half = (dtype == "f16" || dtype == "float16" || dtype == "half");
+#define SM100_INFO_ONE(In, TileTag, Stages, MinBlk)                                   \
+  do {                                                                                \
+    d["smem_bytes"] = cute_gemm::                                                     \
+        sm100_deep_smem_bytes<In, warpconvnet::gemm::TileTag, In, Stages, MinBlk>();  \
+    d["max_active_blocks_per_sm"] =                                                   \
+        cute_gemm::sm100_deep_max_active_blocks<In,                                   \
+                                                warpconvnet::gemm::TileTag,           \
+                                                In,                                   \
+                                                Stages,                               \
+                                                MinBlk>();                            \
+  } while (0)
+#define SM100_INFO_SWITCH(In)                       \
+  switch (tile_id) {                                \
+    case 1000:                                      \
+      SM100_INFO_ONE(In, Tile64x64x32, 6, 1);       \
+      break;                                        \
+    case 1001:                                      \
+      SM100_INFO_ONE(In, Tile64x128x32, 6, 1);      \
+      break;                                        \
+    case 1002:                                      \
+      SM100_INFO_ONE(In, Tile64x128x32, 4, 1);      \
+      break;                                        \
+    case 1003:                                      \
+      SM100_INFO_ONE(In, Tile64x128x32, 8, 1);      \
+      break;                                        \
+    case 1004:                                      \
+      SM100_INFO_ONE(In, Tile64x64x32, 10, 1);      \
+      break;                                        \
+    case 1005:                                      \
+      SM100_INFO_ONE(In, Tile64x128x32_8W, 6, 1);   \
+      break;                                        \
+    case 1006:                                      \
+      SM100_INFO_ONE(In, Tile64x128x32, 4, 3);      \
+      break;                                        \
+    case 1007:                                      \
+      SM100_INFO_ONE(In, Tile64x64x32, 4, 4);       \
+      break;                                        \
+    case 1008:                                      \
+      SM100_INFO_ONE(In, Tile64x64x32, 4, 3);       \
+      break;                                        \
+    case 1009:                                      \
+      SM100_INFO_ONE(In, Tile64x128x32, 3, 3);      \
+      break;                                        \
+    default:                                        \
+      break;                                        \
+  }
+        if (is_half) {
+          SM100_INFO_SWITCH(cutlass::half_t);
+        } else {
+          SM100_INFO_SWITCH(cutlass::bfloat16_t);
+        }
+#undef SM100_INFO_SWITCH
+#undef SM100_INFO_ONE
+#endif
+        return d;
+      },
+      py::arg("tile_id"),
+      py::arg("dtype") = "f16",
+      "Static smem footprint and cudaOccupancyMaxActiveBlocksPerMultiprocessor "
+      "for an sm100 deep-pipe forward tile (1000-1009). -1 if the build has no "
+      "accelerated 10.0a target.");
 }
 }  // namespace bindings
 }  // namespace warpconvnet

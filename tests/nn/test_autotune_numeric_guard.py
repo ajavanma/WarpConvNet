@@ -444,3 +444,137 @@ def test_fail_open_when_all_candidates_disqualified(
         if "self-check disabled for this sweep" in rec.getMessage()
     ]
     assert len(disabled) == 1 and "disqualified" in disabled[0].lower()
+
+
+# ---------------------------------------------------------------------------
+# Lazy fp32 escalation of the numeric guard
+#
+# The oracle used to be built at the COMPUTE dtype, which inverts the guard in
+# the fp16 denormal band (commit 9e3ccbd). The first fix computed an fp32 oracle
+# on EVERY sweep; these tests pin the current contract instead: the fp32 oracle
+# is built only when a verdict actually depends on it (a disqualification, or a
+# compute-dtype reference with no signal), and it then adjudicates the whole
+# sweep.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def count_fp32_oracles(monkeypatch):
+    """Count how many times the guard materialises fp32 reference operands."""
+    calls = []
+    real = autotune._fp32_reference_operands
+
+    def _counting(*tensors):
+        calls.append(len(tensors))
+        return real(*tensors)
+
+    monkeypatch.setattr(autotune, "_fp32_reference_operands", _counting)
+    return calls
+
+
+@pytest.fixture
+def flushing_explicit_gemm(monkeypatch):
+    """Simulate the fp16 flush-to-zero reference deterministically.
+
+    ``explicit_gemm`` keeps its real behaviour at compute_dtype float32 (the
+    escalated oracle) and is scaled down by ``factor`` at any reduced-precision
+    compute dtype -- exactly the shape of the measured failure, where the fp16
+    oracle came out 1.03e4x smaller than the candidates it was judging.
+    """
+
+    def _make(factor: float):
+        real = backends.BACKWARD_BACKENDS["explicit_gemm"]
+
+        def _flushing(ctx):
+            gi, gw = real(ctx)
+            if ctx.compute_dtype in (torch.float16, torch.bfloat16):
+                gi = None if gi is None else gi * factor
+                gw = None if gw is None else gw * factor
+            return gi, gw
+
+        patched = dict(backends.BACKWARD_BACKENDS)
+        patched["explicit_gemm"] = _flushing
+        monkeypatch.setattr(backends, "BACKWARD_BACKENDS", patched)
+
+    return _make
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_no_fp32_oracle_on_a_healthy_sweep(
+    scoped_benchmark_cache, count_fp32_oracles, autotune_warnings, monkeypatch
+):
+    """Healthy fp16 sweep: nothing is disqualified, so the expensive oracle is
+    never materialised. This is the path that used to pay for it on every sweep
+    (an extra fp32 explicit_gemm plus fp32 copies of every operand)."""
+    monkeypatch.setattr(autotune, "WARPCONVNET_AUTOTUNE_NUMERIC_CHECK", True)
+    grad_output, in_features, weight, kernel_map, num_out_coords, device = _build_backward_probe()
+
+    results = _run_backward_benchmarks(
+        grad_output.half(),
+        in_features.half(),
+        weight.half(),
+        kernel_map,
+        num_out_coords,
+        torch.float16,
+        device,
+        custom_params=[("explicit_gemm", {}), ("cutlass_implicit_gemm", {})],
+        needs_input_grad=(True, False),
+    )
+    assert len(results) >= 1
+    assert not any("DISQUALIFIED" in rec.getMessage() for rec in autotune_warnings)
+    assert count_fp32_oracles == [], "fp32 oracle built on a sweep that needed no escalation"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp32_escalation_rescues_an_underflowed_reference(
+    scoped_benchmark_cache, flushing_explicit_gemm, count_fp32_oracles, monkeypatch
+):
+    """The compute-dtype oracle is 1e4x too small, so every accurate candidate
+    would be disqualified. The guard must escalate to fp32 and keep them."""
+    monkeypatch.setattr(autotune, "WARPCONVNET_AUTOTUNE_NUMERIC_CHECK", True)
+    flushing_explicit_gemm(1e-4)
+    grad_output, in_features, weight, kernel_map, num_out_coords, device = _build_backward_probe()
+
+    results = _run_backward_benchmarks(
+        grad_output.half(),
+        in_features.half(),
+        weight.half(),
+        kernel_map,
+        num_out_coords,
+        torch.float16,
+        device,
+        custom_params=[("explicit_gemm", {}), ("cutlass_implicit_gemm", {})],
+        needs_input_grad=(True, False),
+    )
+    algos = [algo for algo, _, _ in results]
+    # The accurate candidate survives...
+    assert "cutlass_implicit_gemm" in algos
+    # ...and the flushing reference algo does NOT, because the fp32 oracle sees
+    # through it. (Under a compute-dtype oracle the verdict is exactly inverted.)
+    assert "explicit_gemm" not in algos
+    assert count_fp32_oracles, "guard failed to escalate to the fp32 oracle"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp32_escalation_when_reference_has_no_signal(
+    scoped_benchmark_cache, flushing_explicit_gemm, count_fp32_oracles, monkeypatch
+):
+    """Total flush: the compute-dtype oracle is all-zero. Previously the guard
+    just switched itself off; now it escalates and stays active."""
+    monkeypatch.setattr(autotune, "WARPCONVNET_AUTOTUNE_NUMERIC_CHECK", True)
+    flushing_explicit_gemm(0.0)
+    grad_output, in_features, weight, kernel_map, num_out_coords, device = _build_backward_probe()
+
+    results = _run_backward_benchmarks(
+        grad_output.half(),
+        in_features.half(),
+        weight.half(),
+        kernel_map,
+        num_out_coords,
+        torch.float16,
+        device,
+        custom_params=[("cutlass_implicit_gemm", {})],
+        needs_input_grad=(True, False),
+    )
+    assert count_fp32_oracles, "guard failed to escalate on a signal-free reference"
+    assert [algo for algo, _, _ in results] == ["cutlass_implicit_gemm"]

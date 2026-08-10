@@ -396,6 +396,11 @@ if _HAS_TORCH:
                 "warpconvnet/csrc/find_first_gt_bsearch.cu",
                 "warpconvnet/csrc/radius_search_kernels.cu",
                 "warpconvnet/csrc/mask_gemm_kernels_fwd.cu",
+                # Blackwell-only deep-pipe forward tiles (1000-1004). Own TU so
+                # an incremental rebuild of them does not recompile the 100+
+                # incumbent forward instantiations. Empty unless the build has
+                # an accelerated 10.0a target.
+                "warpconvnet/csrc/mask_gemm_kernels_fwd_sm100.cu",
                 "warpconvnet/csrc/mask_gemm_kernels_dgrad.cu",
                 "warpconvnet/csrc/mask_gemm_kernels_wgrad.cu",
                 "warpconvnet/csrc/window_grouping_kernels.cu",

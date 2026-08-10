@@ -4,7 +4,7 @@
 # Algorithm enums, benchmark parameter lists, and parameter filtering for
 # sparse convolution AB (gather-scatter) and AtB (gather-gather) algorithm selection.
 
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from enum import Enum
 
@@ -323,6 +323,11 @@ _AB_MASK_GEMM_STRIDED_F32ACC = (
     else []
 )
 
+# Blackwell (sm_100) deep-pipe forward tiles, owned by algo_params_sm100.py. The
+# python arch gate in detail/tile_metadata.py filters them out on non-sm_100 and
+# `_HAS_MASK_GEMM` guards the no-extension case, so importing is unconditional.
+from .algo_params_sm100 import _AB_MASK_SM100_NARROW, _AB_MASK_SM100_WIDE  # noqa: E402
+
 # Full mask_gemm pool (F32Acc + F32-accum-pcoff + F16Acc + F16-accum-pcoff).
 # Referenced by _AB_PARAMS_AUTO so env-var overrides like
 # WARPCONVNET_AB_ALGO_MODE=["mask_gemm"] still see all variants via the "all"
@@ -474,7 +479,9 @@ _ATB_EXPLICIT_GROUPED = [("explicit_gemm_grouped", {"saturation_m": 2000})]
 import math as _math
 
 
-def _ab_mask_pool(use_fp16_accum: bool, max_ch: int) -> List[Tuple[str, Dict[str, Any]]]:
+def _ab_mask_pool(
+    use_fp16_accum: bool, max_ch: int, out_channels: Optional[int] = None
+) -> List[Tuple[str, Dict[str, Any]]]:
     """AB (fwd/dgrad) mask_gemm building block with accumulator-precision gating.
 
     Single source for the precision ladder shared by the adaptive and trimmed AB
@@ -487,6 +494,20 @@ def _ab_mask_pool(use_fp16_accum: bool, max_ch: int) -> List[Tuple[str, Dict[str
     """
     pool = list(_AB_MASK_GEMM_F32ACC)
     pool.extend(_AB_MASK_GEMM_PCOFF_F32ACC)
+    # sm_100 deep-pipe forward tiles. Measured 1.20-1.55x (median 1.31x) over the
+    # best incumbent on the fused forward at N>=100k, 16/16 cells; they lose
+    # nothing at small N because the autotuner times them like any other
+    # candidate. Banded because 64x128 tiles need C_out>=128 (TileMetadata
+    # .handles_c_out enforces it; pooling the wrong band only wastes sweep time).
+    # Band on C_out ALONE, not max(C_in, C_out): the tiles constrain the OUTPUT
+    # width (TileMetadata.handles_c_out), so a wide-in/narrow-out decoder layer
+    # (e.g. 256->64) banded by max_ch got the WIDE list, had all four rejected by
+    # handles_c_out, and fell back to cutlass_implicit_gemm while the NARROW
+    # tiles that WOULD have been legal were never pooled. Measured on device:
+    # POOLED_BUT_NONE_VIABLE for C 256->64 and 128->64 at N=100k and 500k, both
+    # dtypes -- 8 of 24 probed channel configurations.
+    _c_out = max_ch if out_channels is None else out_channels
+    pool.extend(_AB_MASK_SM100_WIDE if _c_out >= 128 else _AB_MASK_SM100_NARROW)
     if use_fp16_accum:
         pool.extend(_AB_MASK_GEMM_F16ACC)
         pool.extend(_AB_MASK_GEMM_PCOFF_F16ACC)
@@ -524,7 +545,7 @@ def _get_adaptive_AB_params(
     max_ch = max(in_channels, out_channels)
     log_n = _math.ceil(_math.log2(num_in_coords)) if num_in_coords > 1 else 0
 
-    _ab_prod = _ab_mask_pool(use_fp16_accum, max_ch)
+    _ab_prod = _ab_mask_pool(use_fp16_accum, max_ch, out_channels)
     _cutlass = _with_fp16_accum(_AB_CUTLASS_IMPLICIT, use_fp16_accum)
     _cutlass_grp = _with_fp16_accum(_AB_CUTLASS_GROUPED, use_fp16_accum)
 
@@ -599,7 +620,7 @@ def _get_trimmed_AB_params(
     max_ch = max(in_channels, out_channels)
     log_n = _math.ceil(_math.log2(num_in_coords)) if num_in_coords > 1 else 0
 
-    _ab_prod = _ab_mask_pool(use_fp16_accum, max_ch)
+    _ab_prod = _ab_mask_pool(use_fp16_accum, max_ch, out_channels)
     _cutlass = _with_fp16_accum(_AB_CUTLASS_IMPLICIT, use_fp16_accum)
     _cutlass_grp = _with_fp16_accum(_AB_CUTLASS_GROUPED, use_fp16_accum)
 
@@ -648,6 +669,13 @@ def _get_trimmed_AB_params(
 _ALL_AB_PARAMS = [
     # mask_gemm fused mask kernels
     *_AB_MASK_GEMM,
+    # Blackwell (sm_100) deep-pipe forward tiles. Without these the algo-NAME
+    # filters (WARPCONVNET_AB_ALGO_MODE=["mask_gemm"] / "all") resolve against a
+    # pool that excludes them, so an explicit "use all mask_gemm" override came
+    # out SLOWER than the default auto. Filtered out on non-sm_100 by the python
+    # arch gate in detail/tile_metadata.py.
+    *_AB_MASK_SM100_WIDE,
+    *_AB_MASK_SM100_NARROW,
     # Explicit GEMM (per-offset matmul via cuBLAS)
     ("explicit_gemm", {}),
     *[("explicit_gemm_grouped", {"saturation_m": m}) for m in [2000, 5000, 10000]],
