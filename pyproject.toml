@@ -54,10 +54,16 @@ models = [
     "torchmetrics",
 ]
 
+demo = [
+    "huggingface-hub",
+    "trimesh",
+]
+
 all = [
     "warpconvnet[dev]",
     "warpconvnet[docs]",
     "warpconvnet[models]",
+    "warpconvnet[demo]",
 ]
 
 [project.scripts]

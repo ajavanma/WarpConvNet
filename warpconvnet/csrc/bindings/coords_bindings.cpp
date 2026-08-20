@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2025-present NVIDIA CORPORATION & AFFILIATES. All rights
+// reserved. SPDX-License-Identifier: Apache-2.0
 //
 // Pybind11 bindings for coordinate search and utility kernels.
 // Exposes _C.coords submodule.
@@ -58,6 +58,24 @@ void coords_radius_search_write(torch::Tensor points,
                                 float radius,
                                 float cell_size,
                                 int capacity);
+
+// Forward declaration: capped cell-neighbourhood gather (cell_gather_kernels.cu)
+void coords_cell_gather(torch::Tensor points,
+                        torch::Tensor queries,
+                        torch::Tensor query_batch,
+                        torch::Tensor ref_offsets,
+                        torch::Tensor sorted_order,
+                        torch::Tensor cell_starts,
+                        torch::Tensor cell_counts,
+                        torch::Tensor keys,
+                        torch::Tensor values,
+                        torch::Tensor out,
+                        int num_cells,
+                        int nsample,
+                        float cell_size,
+                        float radius_sq,
+                        bool use_radius,
+                        int capacity);
 
 // Forward declarations: window grouping (counting sort)
 void coords_window_group_histogram(torch::Tensor grid_coord,
@@ -149,6 +167,26 @@ void register_coords(py::module_ &m) {
              py::arg("num_cells"),
              py::arg("radius"),
              py::arg("cell_size"),
+             py::arg("capacity"));
+
+  // --- Capped cell-neighbourhood gather (voxel_block_gather / capped_ball_query) ---
+  coords.def("cell_gather",
+             &coords_cell_gather,
+             py::arg("points"),
+             py::arg("queries"),
+             py::arg("query_batch"),
+             py::arg("ref_offsets"),
+             py::arg("sorted_order"),
+             py::arg("cell_starts"),
+             py::arg("cell_counts"),
+             py::arg("keys"),
+             py::arg("values"),
+             py::arg("out"),
+             py::arg("num_cells"),
+             py::arg("nsample"),
+             py::arg("cell_size"),
+             py::arg("radius_sq"),
+             py::arg("use_radius"),
              py::arg("capacity"));
 
   // --- Window grouping (counting sort) ---

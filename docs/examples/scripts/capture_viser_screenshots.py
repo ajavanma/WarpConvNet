@@ -9,7 +9,7 @@ Chromium via playwright to snapshot the WebGL scene.
 Run from repo root:
 
     source .venv/bin/activate
-    pip install viser trimesh playwright
+    pip install -e '.[demo]' viser playwright
     playwright install chromium
     python docs/examples/scripts/capture_viser_screenshots.py
 

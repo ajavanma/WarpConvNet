@@ -295,6 +295,7 @@ The cache file (`~/.cache/warpconvnet/benchmark_cache_generic.msgpack`) is GPU-a
 ### Optional dependency groups
 
 - `warpconvnet[dev]`: Development tools (pytest, coverage, pre-commit)
+- `warpconvnet[demo]`: Shared demo tools for Hugging Face downloads and mesh I/O
 - `warpconvnet[docs]`: Documentation building tools
 - `warpconvnet[models]`: Additional dependencies for model training (wandb, hydra, etc.)
 

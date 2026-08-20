@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-present NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import glob
@@ -395,6 +395,7 @@ if _HAS_TORCH:
                 "warpconvnet/csrc/morton_code.cu",
                 "warpconvnet/csrc/find_first_gt_bsearch.cu",
                 "warpconvnet/csrc/radius_search_kernels.cu",
+                "warpconvnet/csrc/cell_gather_kernels.cu",
                 "warpconvnet/csrc/mask_gemm_kernels_fwd.cu",
                 # Blackwell-only deep-pipe forward tiles (1000-1004). Own TU so
                 # an incremental rebuild of them does not recompile the 100+

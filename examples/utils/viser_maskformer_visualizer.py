@@ -37,7 +37,9 @@ try:
     import trimesh
     import viser
 except ImportError as exc:  # pragma: no cover - optional dep
-    raise ImportError("viser visualization requires `pip install viser trimesh`") from exc
+    raise ImportError(
+        'viser visualization requires `pip install "warpconvnet[demo]" viser`'
+    ) from exc
 
 # Voxel that has no instance (gt -1 or pred had no query above threshold).
 NO_INSTANCE_COLOR = np.array([60, 60, 60], dtype=np.uint8)

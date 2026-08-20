@@ -185,7 +185,7 @@ Toggle the [viser](https://viser.studio) viewer to inspect predictions vs.
 ground-truth instance masks side-by-side while training:
 
 ```bash
-pip install viser trimesh
+pip install "warpconvnet[demo]" viser
 
 python examples/train/maskformer.py \
     viz.enabled=true \

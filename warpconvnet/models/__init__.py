@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-present NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Lazy model re-exports.
@@ -37,6 +37,14 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "PointMinkUNet34": ("warpconvnet.models.mink_unet", "PointMinkUNet34"),
     "PointMinkUNetBase": ("warpconvnet.models.mink_unet", "PointMinkUNetBase"),
     "PointNet": ("warpconvnet.models.pointnet", "PointNet"),
+    # OpenShape PointBERT / Point Patch Transformer -- see models/ppat/.
+    "PointPatchTransformer": ("warpconvnet.models.ppat", "PointPatchTransformer"),
+    "ProjectedPointPatchTransformer": (
+        "warpconvnet.models.ppat",
+        "ProjectedPointPatchTransformer",
+    ),
+    "build_openshape_pointbert": ("warpconvnet.models.ppat", "build_openshape_pointbert"),
+    "load_openshape_pointbert": ("warpconvnet.models.ppat", "load_openshape_pointbert"),
     "PointTransformerV3": ("warpconvnet.models.point_transformer_v3", "PointTransformerV3"),
     # SpaceFormer family (backbone + instance-seg decoder) — see models/spaceformer/.
     "SpaCeFormer": ("warpconvnet.models.spaceformer", "SpaCeFormer"),

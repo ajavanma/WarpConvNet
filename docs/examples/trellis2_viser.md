@@ -13,11 +13,11 @@ the viser scene.
 
 ## Setup
 
-Install WarpConvNet with model dependencies, then add the viewer and TRELLIS
-runtime dependencies:
+Install WarpConvNet with model and shared demo dependencies, then add the
+viewer-specific TRELLIS runtime dependencies:
 
 ```bash
-pip install "warpconvnet[models]" viser pillow safetensors huggingface_hub
+pip install "warpconvnet[models,demo]" viser pillow safetensors transformers
 ```
 
 The first run downloads model weights from Hugging Face:

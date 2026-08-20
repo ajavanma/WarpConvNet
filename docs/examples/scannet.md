@@ -240,7 +240,7 @@ checkpoint required). Regenerate them with:
 
 ````
 ```bash
-pip install viser trimesh playwright
+pip install "warpconvnet[demo]" viser playwright
 playwright install chromium
 python docs/examples/scripts/capture_viser_screenshots.py
 ```

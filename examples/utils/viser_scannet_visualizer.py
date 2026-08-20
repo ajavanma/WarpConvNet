@@ -24,7 +24,9 @@ try:
     import trimesh
     import viser
 except ImportError as exc:  # pragma: no cover - optional dep
-    raise ImportError("viser visualization requires `pip install viser trimesh`") from exc
+    raise ImportError(
+        'viser visualization requires `pip install "warpconvnet[demo]" viser`'
+    ) from exc
 
 
 # ScanNet 20-class palette (RGB 0..255), order matches ScanNet benchmark.
