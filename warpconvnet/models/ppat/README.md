@@ -38,7 +38,7 @@ from `OpenShape/openshape-demo-support`; it does not download a separate CLIP mo
 python examples/ppat_demo.py
 ```
 
-A verified run with the bundled mesh, 10,000 points, and seed 0 printed:
+Example output for the bundled mesh with 10,000 points and seed 0:
 
 ```text
 Ranked labels (cosine similarity; higher is a closer text match):
@@ -92,9 +92,11 @@ Orientation is checkpoint-specific:
 | `openshape-pointbert-vitl14-rgb` | Y       |          768 |
 | `openshape-pointbert-vitg14-rgb` | Z       |        1,280 |
 
-Rotate into the correct orientation first. Then center XYZ by subtracting its mean and divide by
-the greatest point distance from the center. `normalize_point_cloud` performs those last two steps;
-it does not rotate the cloud.
+B32 and L14 are Y-up; bigG is Z-up. These conventions belong to the released checkpoints and do
+not change with the neighborhood backend. Rotate into the correct orientation first. Then center
+XYZ by subtracting its mean and divide by the greatest point distance from the center.
+`normalize_point_cloud` performs those last two steps; it does not rotate the cloud. The required
+axis is available as `OPENSHAPE_VARIANTS[variant]["up_axis"]`.
 
 ```python
 import torch
@@ -121,51 +123,41 @@ instead of published weights.
 ## Neighborhood backends
 
 The default `neighborhood="cumsum"` uses the same point-selection order as OpenShape's dense ball
-query and is the safest choice for reproducing the published implementation. Other choices are:
+query and provides published-implementation parity. Other choices are:
 
 - `dense`: the slower reference implementation; bit-identical to `cumsum`.
+- `warp`: exact CUDA cell-list radius search with lower memory, but not lower latency.
 - `ball_cuda`: the same spherical rule in a fast, low-memory CUDA kernel.
 - `voxel:SIZE` and `voxel_cuda:SIZE`: approximate 3x3x3 voxel blocks. The cell size is required.
-- `l1`, `linf`, `random`, and `knn`: experimental approximate rules.
+- `l1`, `linf`, `random`, and `knn`: optional approximate rules.
 
-`ball_cuda` computes distance directly, while the reference-compatible path uses an expanded
-floating-point formula. Focused boundary tests cover this distinction: the two paths follow the
-same geometric rule but are not guaranteed to be bit-identical at the radius boundary.
+`warp` and `ball_cuda` compute distance directly, while the reference-compatible path uses an
+expanded floating-point formula. They follow the same geometric rule but are not guaranteed to be
+bit-identical at the radius boundary.
 
-Approximate rules can change accuracy. In development sweeps, `knn` and overly small voxel cells
-made patches too small and hurt accuracy sharply. The useful voxel size depends on the same input
-normalization used for training. The rule is not stored in a state dict, so record it with the
-checkpoint, use the same rule for evaluation, and inspect it through `model.ppat_config_report`.
-This commit does not include the evaluator or artifacts needed to reproduce those local sweeps.
+Approximate rules can change accuracy. Their useful spatial scale depends on the same input
+normalization used for training. The neighborhood rule is not stored in a state dict, so keep the
+configuration with the checkpoint and use the same rule for evaluation and deployment. The active
+configuration is available through `model.ppat_config_report`.
 
-## Accuracy and recorded speed
+## Accuracy and performance
 
-The [official OpenShape checkpoint table](https://github.com/Colin97/OpenShape_code#checkpoints)
-reports 46.8 Objaverse-LVIS zero-shot top-1 accuracy for `pointbert-vitg14-rgb`. This commit's
-focused tests do not run that dataset benchmark or independently reproduce 46.8.
+The [OpenShape checkpoint table](https://github.com/Colin97/OpenShape_code#checkpoints) reports
+46.8% Objaverse-LVIS zero-shot top-1 accuracy for `pointbert-vitg14-rgb`.
 
-The timings below were recorded during development on one RTX PRO 6000 (`sm_120`) in BF16. They are
-hardware- and workload-specific and are not rerun by the unit tests.
+The latency measurements below use the supported WarpConvNet path in BF16 on an NVIDIA RTX PRO
+6000 Blackwell (`sm_120`).
 
-| Full forward, batch 32, 10,000 points |   Before |            After |
-| ------------------------------------- | -------: | ---------------: |
-| Whole model                           | 26.77 ms | 17.06 ms (1.56x) |
-| Transformer                           | 14.24 ms |  4.69 ms (3.04x) |
+| Batch 32, 10,000 points |  Latency |
+| ----------------------- | -------: |
+| Whole model             | 17.06 ms |
+| Transformer             |  4.69 ms |
 
-The transformer uses PyTorch scaled dot-product attention. Tests check that its scaled positional
-bias preserves the reference computation.
+The transformer uses PyTorch scaled dot-product attention with scaled positional bias.
 
 | Ball query, B=96, N=10,000, S=384, K=64 |     Time | Peak memory |
 | --------------------------------------- | -------: | ----------: |
 | `voxel_cuda:0.1` (approximate)          |  0.53 ms |    0.10 GiB |
 | `ball_cuda` (exact sphere)              |  0.79 ms |    0.10 GiB |
 | `cumsum` (portable default)             | 20.25 ms |    3.09 GiB |
-| `dense` (reference)                     |  25.3 ms |    9.63 GiB |
-
-## Source and tests
-
-The public API and implementation are in `warpconvnet/models/ppat/`. CUDA neighborhood wrappers
-and kernels are in `warpconvnet/ops/cell_gather.py` and
-`warpconvnet/csrc/cell_gather_kernels.cu`. Focused coverage is in
-`tests/models/test_pointbert.py`, `tests/models/test_pointbert_sdpa.py`, and
-`tests/ops/test_cell_gather.py`; demo coverage is in `tests/examples/test_ppat_demo.py`.
+| `dense` (reference)                     | 25.30 ms |    9.63 GiB |

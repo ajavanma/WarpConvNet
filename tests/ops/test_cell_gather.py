@@ -29,7 +29,11 @@ if not torch.cuda.is_available():
 try:
     import warpconvnet._C as _C
 
-    from warpconvnet.ops.cell_gather import capped_ball_query, voxel_block_gather
+    from warpconvnet.ops.cell_gather import (
+        capped_ball_query,
+        cell_nearest_k,
+        voxel_block_gather,
+    )
 
     if not hasattr(_C.coords, "cell_gather"):
         raise ImportError("_C.coords.cell_gather missing")
@@ -41,6 +45,11 @@ except ImportError as exc:  # pragma: no cover - environment guard
     )
 
 DEVICE = "cuda:0"
+CELL_NEAREST_AVAILABLE = hasattr(_C.coords, "cell_nearest_k")
+requires_cell_nearest = pytest.mark.skipif(
+    not CELL_NEAREST_AVAILABLE,
+    reason="cell-nearest-k CUDA kernel not built",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -602,3 +611,188 @@ def test_capped_ball_query_vs_cumsum_backend():
             )
     frac = disagree.float().mean().item()
     assert frac < 1e-2, f"capped_ball_query disagrees with cumsum on {frac:.2%} of queries"
+
+
+# ---------------------------------------------------------------------------
+# Fused, order-independent cell-list nearest-k
+# ---------------------------------------------------------------------------
+
+
+@requires_cell_nearest
+@pytest.mark.parametrize("cell_size", [0.09, 0.15, 0.25])
+def test_cell_nearest_k_matches_direct_dense_knn_in_packed_batches(cell_size):
+    clouds = [_rand_cloud(1200, seed=60), _near_line_cloud(900, seed=61)]
+    points, ro, queries, qo = _make_batch(clouds, [48, 32], seed=62)
+    k = 64
+
+    result = cell_nearest_k(
+        points,
+        ro,
+        queries,
+        qo,
+        k,
+        cell_size=cell_size,
+        max_shell=8,
+    )
+    assert (result.status == 0).all()
+    assert (result.counts == k).all()
+
+    for batch in range(2):
+        query_slice = slice(int(qo[batch]), int(qo[batch + 1]))
+        point_slice = slice(int(ro[batch]), int(ro[batch + 1]))
+        distance_sq = (
+            (queries[query_slice, None, :] - points[None, point_slice, :]).square().sum(-1)
+        )
+        expected_distance, expected_local = torch.topk(
+            distance_sq,
+            k,
+            dim=-1,
+            largest=False,
+            sorted=True,
+        )
+        expected_global = expected_local + ro[batch].long()
+        assert torch.equal(result.indices[query_slice].long(), expected_global)
+        torch.testing.assert_close(
+            result.squared_distances[query_slice],
+            expected_distance,
+            rtol=1e-6,
+            atol=1e-7,
+        )
+
+
+@requires_cell_nearest
+def test_cell_nearest_k_status_ties_and_underfill_contract():
+    tied = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ],
+        device=DEVICE,
+    )
+    query = torch.zeros(1, 3, device=DEVICE)
+    tied_result = cell_nearest_k(
+        tied,
+        _offsets([4]),
+        query,
+        _offsets([1]),
+        3,
+        cell_size=2.0,
+        max_shell=1,
+    )
+    assert tied_result.status.item() == 0
+    assert tied_result.indices.tolist() == [[0, 1, 2]]
+
+    # All points lie in the query cell, so the complete batch is scanned. The
+    # result is certified but underfilled: bit 2 (value 4), -1, and +inf.
+    short = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [0.02, 0.0, 0.0]],
+        device=DEVICE,
+    )
+    short_result = cell_nearest_k(
+        short,
+        _offsets([3]),
+        query,
+        _offsets([1]),
+        4,
+        cell_size=1.0,
+        max_shell=0,
+    )
+    assert short_result.status.item() == 4
+    assert short_result.counts.item() == 3
+    assert short_result.indices[0, -1].item() == -1
+    assert torch.isinf(short_result.squared_distances[0, -1])
+
+    # Two valid picks are found, but a distant third point remains unvisited and
+    # shell zero cannot prove exactness: bit 1 (value 2), without underfill.
+    sparse = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [10.0, 0.0, 0.0]],
+        device=DEVICE,
+    )
+    budget_result = cell_nearest_k(
+        sparse,
+        _offsets([3]),
+        query,
+        _offsets([1]),
+        2,
+        cell_size=1.0,
+        max_shell=0,
+    )
+    assert budget_result.status.item() == 2
+    assert budget_result.indices.tolist() == [[0, 1]]
+
+
+@requires_cell_nearest
+def test_cell_nearest_k_is_deterministic_and_stable_for_untied_permutations():
+    points = _rand_cloud(777, seed=63).to(DEVICE)
+    queries = points[::53].contiguous()
+    ro = _offsets([len(points)])
+    qo = _offsets([len(queries)])
+    kwargs = {"cell_size": 0.13, "max_shell": 6}
+
+    baseline = cell_nearest_k(points, ro, queries, qo, 32, **kwargs)
+    repeated = cell_nearest_k(points, ro, queries, qo, 32, **kwargs)
+    assert torch.equal(baseline.indices, repeated.indices)
+    assert torch.equal(baseline.squared_distances, repeated.squared_distances)
+    assert torch.equal(baseline.status, repeated.status)
+
+    generator = torch.Generator(device=DEVICE).manual_seed(64)
+    permutation = torch.randperm(len(points), generator=generator, device=DEVICE)
+    permuted = cell_nearest_k(points[permutation], ro, queries, qo, 32, **kwargs)
+    mapped_to_original = permutation[permuted.indices.long()]
+    assert (baseline.status == 0).all() and (permuted.status == 0).all()
+    assert torch.equal(baseline.indices.long(), mapped_to_original)
+
+
+@requires_cell_nearest
+def test_cell_nearest_k_uses_row_index_to_break_distance_ties():
+    points = torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], device=DEVICE)
+    query = torch.zeros(1, 3, device=DEVICE)
+    offsets = _offsets([2])
+    query_offsets = _offsets([1])
+
+    baseline = cell_nearest_k(
+        points,
+        offsets,
+        query,
+        query_offsets,
+        1,
+        cell_size=1.0,
+        max_shell=2,
+    )
+    permutation = torch.tensor([1, 0], device=DEVICE)
+    permuted = cell_nearest_k(
+        points[permutation],
+        offsets,
+        query,
+        query_offsets,
+        1,
+        cell_size=1.0,
+        max_shell=2,
+    )
+
+    assert baseline.status.item() == 0
+    assert permuted.status.item() == 0
+    assert baseline.indices.item() == 0
+    assert permutation[permuted.indices.long()].item() == 1
+
+
+@requires_cell_nearest
+def test_cell_nearest_k_reports_packed_coordinate_clipping():
+    coordinate_max = 131071.0
+    points = torch.tensor(
+        [[coordinate_max, 0.0, 0.0], [coordinate_max - 0.1, 0.0, 0.0]],
+        device=DEVICE,
+    )
+    result = cell_nearest_k(
+        points,
+        _offsets([2]),
+        points[:1].contiguous(),
+        _offsets([1]),
+        1,
+        cell_size=1.0,
+        max_shell=1,
+    )
+    assert result.indices.tolist() == [[0]]
+    assert result.status.item() == 8

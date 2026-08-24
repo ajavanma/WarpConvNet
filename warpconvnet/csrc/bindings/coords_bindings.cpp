@@ -76,6 +76,25 @@ void coords_cell_gather(torch::Tensor points,
                         float radius_sq,
                         bool use_radius,
                         int capacity);
+void coords_cell_nearest_k(torch::Tensor points,
+                           torch::Tensor queries,
+                           torch::Tensor query_batch,
+                           torch::Tensor ref_offsets,
+                           torch::Tensor sorted_order,
+                           torch::Tensor cell_starts,
+                           torch::Tensor cell_counts,
+                           torch::Tensor keys,
+                           torch::Tensor values,
+                           torch::Tensor out_indices,
+                           torch::Tensor out_distances,
+                           torch::Tensor out_counts,
+                           torch::Tensor out_status,
+                           torch::Tensor out_visited,
+                           int num_cells,
+                           int k,
+                           float cell_size,
+                           int max_shell,
+                           int capacity);
 
 // Forward declarations: window grouping (counting sort)
 void coords_window_group_histogram(torch::Tensor grid_coord,
@@ -187,6 +206,29 @@ void register_coords(py::module_ &m) {
              py::arg("cell_size"),
              py::arg("radius_sq"),
              py::arg("use_radius"),
+             py::arg("capacity"));
+
+  // --- Fused, order-independent voxel-shell nearest-k ---
+  coords.def("cell_nearest_k",
+             &coords_cell_nearest_k,
+             py::arg("points"),
+             py::arg("queries"),
+             py::arg("query_batch"),
+             py::arg("ref_offsets"),
+             py::arg("sorted_order"),
+             py::arg("cell_starts"),
+             py::arg("cell_counts"),
+             py::arg("keys"),
+             py::arg("values"),
+             py::arg("out_indices"),
+             py::arg("out_distances"),
+             py::arg("out_counts"),
+             py::arg("out_status"),
+             py::arg("out_visited"),
+             py::arg("num_cells"),
+             py::arg("k"),
+             py::arg("cell_size"),
+             py::arg("max_shell"),
              py::arg("capacity"));
 
   // --- Window grouping (counting sort) ---

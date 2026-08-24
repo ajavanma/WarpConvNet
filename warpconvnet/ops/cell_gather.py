@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Capped cell-neighbourhood gather for point-transformer set abstraction.
+"""Cell-list neighbourhood operations for point-transformer set abstraction.
 
 Two rules over the same 3x3x3 cell-block traversal (one CUDA kernel family,
 switched by a compile-time flag):
@@ -20,11 +20,16 @@ group in cell order instead would bias the selection toward one part of the bloc
 Both are capped: the traversal stops after ``nsample`` accepted hits, so unlike
 ``warpconvnet.geometry.coords.search.search_results.radius_search`` it does not
 materialise neighbours that will be discarded after applying the cap.
+
+``cell_nearest_k`` instead scans a bounded sequence of voxel shells and keeps
+only a fixed-size nearest-point heap. It reports whether the scanned shells
+prove the global result, allowing callers to fall back only for unresolved
+queries.
 """
 
 import math
 from numbers import Integral, Real
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 from jaxtyping import Float, Int
@@ -33,7 +38,47 @@ from torch import Tensor
 import warpconvnet._C as _C
 from warpconvnet.geometry.coords.search.packed_hashmap import PackedHashTable
 
-__all__ = ["voxel_block_gather", "capped_ball_query"]
+__all__ = [
+    "CellNearestKResult",
+    "capped_ball_query",
+    "cell_nearest_k",
+    "voxel_block_gather",
+]
+
+
+class CellNearestKResult(NamedTuple):
+    """Outputs and diagnostics from ``cell_nearest_k``.
+
+    ``indices`` are global indices into the packed ``points`` tensor. Distances
+    are direct FP32 squared Euclidean distances. Inputs of another floating
+    dtype are canonicalized to FP32 before the search. ``counts`` is the number
+    of valid output slots and ``visited`` is the number of point-distance
+    evaluations.
+
+    ``status`` is a bit mask per query: bit 0 marks invalid input or cell
+    metadata, bit 1 means the shell budget ended before global exactness was
+    proven, bit 2 means fewer than ``k`` points were found, and bit 3 means the
+    packed-coordinate boundary clipped the requested shell range. Missing
+    output slots are ``-1`` with infinite distance.
+    """
+
+    indices: Tensor
+    squared_distances: Tensor
+    counts: Tensor
+    status: Tensor
+    visited: Tensor
+
+
+class _PreparedCellSearch(NamedTuple):
+    points: Tensor
+    queries: Tensor
+    ref_offsets: Tensor
+    query_batch: Tensor
+    sorted_order: Tensor
+    cell_starts: Tensor
+    cell_counts: Tensor
+    table: Optional[PackedHashTable]
+    num_cells: int
 
 
 def _validated_offsets(
@@ -65,25 +110,18 @@ def _validated_offsets(
     return offsets64.to(dtype=torch.int32)
 
 
-@torch.no_grad()
-def _cell_gather(
-    points: Float[Tensor, "N 3"],  # noqa: F821
-    ref_offsets: Int[Tensor, "B+1"],  # noqa: F821
-    queries: Float[Tensor, "M 3"],  # noqa: F821
-    query_offsets: Int[Tensor, "B+1"],  # noqa: F821
+def _prepare_cell_search(
+    points: Tensor,
+    ref_offsets: Tensor,
+    queries: Tensor,
+    query_offsets: Tensor,
     cell_size: float,
-    nsample: int,
-    radius_sq: Optional[float] = None,
-) -> Int[Tensor, "M nsample"]:  # noqa: F821
-    """Shared driver: build the cell list, then run the capped 27-way merge.
-
-    ``radius_sq`` of ``None`` selects the distance-free rule; a value selects the
-    exact ``d^2 <= radius_sq`` rule.
-    """
+) -> _PreparedCellSearch:
+    """Validate packed inputs and construct their shared cell-list metadata."""
     if not isinstance(points, Tensor) or not isinstance(queries, Tensor):
         raise TypeError("points and queries must be torch.Tensor objects")
     if not points.is_cuda or not queries.is_cuda:
-        raise ValueError("cell gather is CUDA-only")
+        raise ValueError("cell search is CUDA-only")
     if points.device != queries.device:
         raise ValueError(
             f"points and queries must be on the same CUDA device, got "
@@ -98,31 +136,21 @@ def _cell_gather(
             f"points and queries must have floating-point dtypes, got "
             f"{points.dtype} and {queries.dtype}"
         )
-
     if isinstance(cell_size, bool) or not isinstance(cell_size, Real):
         raise TypeError(f"cell_size must be a real number, got {type(cell_size).__name__}")
     cell_size = float(cell_size)
     if not math.isfinite(cell_size) or cell_size <= 0:
         raise ValueError(f"cell_size must be finite and positive, got {cell_size}")
-    if isinstance(nsample, bool) or not isinstance(nsample, Integral):
-        raise TypeError(f"nsample must be an integer, got {type(nsample).__name__}")
-    nsample = int(nsample)
-    if nsample <= 0:
-        raise ValueError(f"nsample must be positive, got {nsample}")
-    if radius_sq is not None:
-        radius_sq = float(radius_sq)
-        if not math.isfinite(radius_sq) or radius_sq <= 0:
-            raise ValueError(f"radius_sq must be finite and positive, got {radius_sq}")
 
     device = points.device
     N = points.shape[0]
     M = queries.shape[0]
     int32_max = torch.iinfo(torch.int32).max
     if N > int32_max or M > int32_max:
-        raise ValueError(f"cell gather supports at most {int32_max} points and queries")
+        raise ValueError(f"cell search supports at most {int32_max} points and queries")
 
-    # Keep every allocation and launch on the points device without changing the
-    # caller's current device after this function returns.
+    # Keep every allocation on the points device without changing the caller's
+    # current device after this function returns.
     with torch.cuda.device(device):
         ref_offsets = _validated_offsets(
             ref_offsets,
@@ -145,71 +173,212 @@ def _cell_gather(
         queries = queries.float().contiguous()
         ref_counts = ref_offsets[1:] - ref_offsets[:-1]
         query_counts = query_offsets[1:] - query_offsets[:-1]
-
-        out = torch.empty(M, nsample, dtype=torch.int32, device=device)
-        if M == 0:
-            return out
-
         batch_ids = torch.arange(B, device=device, dtype=torch.int32)
-        pt_batch = torch.repeat_interleave(batch_ids, ref_counts.long())
-        q_batch = torch.repeat_interleave(batch_ids, query_counts.long()).contiguous()
+        query_batch = torch.repeat_interleave(batch_ids, query_counts.long()).contiguous()
 
-        # The batch id shares the packed uint64 key with the cell coordinate, so a
-        # neighbour cell of batch b can never resolve to a point of batch b' -- the
-        # kernel needs no separate batch test.
-        pt_cells = torch.floor(points / cell_size).int()
-        q_cells = torch.floor(queries / cell_size)
-        q_cells_min, q_cells_max = torch.stack((q_cells.amin(), q_cells.amax())).tolist()
-        if not math.isfinite(q_cells_min) or not math.isfinite(q_cells_max):
+        if M == 0:
+            empty = torch.empty(0, dtype=torch.int32, device=device)
+            return _PreparedCellSearch(
+                points,
+                queries,
+                ref_offsets,
+                query_batch,
+                empty,
+                empty,
+                empty,
+                None,
+                0,
+            )
+
+        point_batch = torch.repeat_interleave(batch_ids, ref_counts.long())
+        point_cells_float = torch.floor(points / cell_size)
+        query_cells = torch.floor(queries / cell_size)
+        point_min, point_max = torch.stack(
+            (point_cells_float.amin(), point_cells_float.amax())
+        ).tolist()
+        query_min, query_max = torch.stack((query_cells.amin(), query_cells.amax())).tolist()
+        if not math.isfinite(point_min) or not math.isfinite(point_max):
+            raise ValueError("point coordinates must be finite")
+        if not math.isfinite(query_min) or not math.isfinite(query_max):
             raise ValueError("query coordinates must be finite")
-        if q_cells_min < PackedHashTable.COORD_MIN or q_cells_max > PackedHashTable.COORD_MAX:
+        if point_min < PackedHashTable.COORD_MIN or point_max > PackedHashTable.COORD_MAX:
+            raise ValueError(
+                "point cell coordinate out of packed range "
+                f"[{PackedHashTable.COORD_MIN}, {PackedHashTable.COORD_MAX}]: "
+                f"got [{int(point_min)}, {int(point_max)}] (cell_size={cell_size})"
+            )
+        if query_min < PackedHashTable.COORD_MIN or query_max > PackedHashTable.COORD_MAX:
             raise ValueError(
                 "query cell coordinate out of packed range "
                 f"[{PackedHashTable.COORD_MIN}, {PackedHashTable.COORD_MAX}]: "
-                f"got [{int(q_cells_min)}, {int(q_cells_max)}] (cell_size={cell_size})"
+                f"got [{int(query_min)}, {int(query_max)}] (cell_size={cell_size})"
             )
 
-        coords4 = torch.cat([pt_batch.unsqueeze(1), pt_cells], dim=1)
+        # The batch id shares the packed key with the cell coordinate, so a
+        # lookup cannot cross batch boundaries.
+        point_cells = point_cells_float.int()
+        coords4 = torch.cat([point_batch.unsqueeze(1), point_cells], dim=1)
         table = PackedHashTable.from_coords(coords4, device=device)
-
-        # The table hands every point the index of whichever point won the insert
-        # CAS for its cell -- an arbitrary but consistent label in [0, N). Which
-        # point wins is not deterministic, but the labels are only bucket names:
-        # the output is the nsample lowest point indices, which does not depend on
-        # them. Hence bit-identical results across runs despite the racing insert.
         cell_ids = table.search(coords4)
         sorted_cell_ids, sorted_order = torch.sort(cell_ids, stable=True)
-        num_cells = table.num_entries  # == N; labels are point indices, not ranks
+        num_cells = table.num_entries
 
-        # A stable sort leaves each cell's members in ascending point index, which
-        # is what lets the kernel merge 27 already-sorted lists.
         unique_ids, counts = torch.unique_consecutive(sorted_cell_ids, return_counts=True)
         cell_starts = torch.zeros(num_cells, dtype=torch.int32, device=device)
         cell_counts = torch.zeros(num_cells, dtype=torch.int32, device=device)
-        seg_starts = torch.zeros(len(counts), dtype=torch.int32, device=device)
-        torch.cumsum(counts[:-1].int(), dim=0, out=seg_starts[1:])
-        cell_starts[unique_ids.long()] = seg_starts
+        segment_starts = torch.zeros(len(counts), dtype=torch.int32, device=device)
+        torch.cumsum(counts[:-1].int(), dim=0, out=segment_starts[1:])
+        cell_starts[unique_ids.long()] = segment_starts
         cell_counts[unique_ids.long()] = counts.int()
-
-        _C.coords.cell_gather(
+        return _PreparedCellSearch(
             points,
             queries,
-            q_batch,
             ref_offsets,
+            query_batch,
             sorted_order.int().contiguous(),
             cell_starts,
             cell_counts,
-            table.keys_tensor,
-            table.values_tensor,
-            out,
+            table,
             num_cells,
+        )
+
+
+@torch.no_grad()
+def _cell_gather(
+    points: Float[Tensor, "N 3"],  # noqa: F821
+    ref_offsets: Int[Tensor, "B+1"],  # noqa: F821
+    queries: Float[Tensor, "M 3"],  # noqa: F821
+    query_offsets: Int[Tensor, "B+1"],  # noqa: F821
+    cell_size: float,
+    nsample: int,
+    radius_sq: Optional[float] = None,
+) -> Int[Tensor, "M nsample"]:  # noqa: F821
+    """Shared driver: build the cell list, then run the capped 27-way merge.
+
+    ``radius_sq`` of ``None`` selects the distance-free rule; a value selects the
+    exact ``d^2 <= radius_sq`` rule.
+    """
+    if isinstance(nsample, bool) or not isinstance(nsample, Integral):
+        raise TypeError(f"nsample must be an integer, got {type(nsample).__name__}")
+    nsample = int(nsample)
+    if nsample <= 0:
+        raise ValueError(f"nsample must be positive, got {nsample}")
+    if radius_sq is not None:
+        radius_sq = float(radius_sq)
+        if not math.isfinite(radius_sq) or radius_sq <= 0:
+            raise ValueError(f"radius_sq must be finite and positive, got {radius_sq}")
+
+    search = _prepare_cell_search(points, ref_offsets, queries, query_offsets, cell_size)
+    M = search.queries.shape[0]
+    out = torch.empty(M, nsample, dtype=torch.int32, device=search.points.device)
+    if M == 0:
+        return out
+    assert search.table is not None
+    with torch.cuda.device(search.points.device):
+        _C.coords.cell_gather(
+            search.points,
+            search.queries,
+            search.query_batch,
+            search.ref_offsets,
+            search.sorted_order,
+            search.cell_starts,
+            search.cell_counts,
+            search.table.keys_tensor,
+            search.table.values_tensor,
+            out,
+            search.num_cells,
             nsample,
             cell_size,
             radius_sq if radius_sq is not None else 0.0,
             radius_sq is not None,
-            table.capacity,
+            search.table.capacity,
         )
-        return out
+    return out
+
+
+@torch.no_grad()
+def cell_nearest_k(
+    points: Float[Tensor, "N 3"],  # noqa: F821
+    ref_offsets: Int[Tensor, "B+1"],  # noqa: F821
+    queries: Float[Tensor, "M 3"],  # noqa: F821
+    query_offsets: Int[Tensor, "B+1"],  # noqa: F821
+    k: int,
+    *,
+    cell_size: float,
+    max_shell: int,
+) -> CellNearestKResult:
+    """Keep the nearest ``k`` points while scanning bounded cell-list shells.
+
+    Shells ``0`` through ``max_shell`` (inclusive) are scanned in Chebyshev
+    distance from each query cell. The kernel may stop earlier when a geometric
+    lower bound proves that unvisited cells cannot change the nearest set.
+    Results are sorted deterministically by ``(squared_distance, global_index)``.
+
+    This low-level operation never silently falls back. Callers must inspect
+    ``status``: zero certifies the exact direct-distance result for the
+    canonicalized FP32 cloud, while nonzero values have the bit meanings
+    documented by ``CellNearestKResult``. This is geometric exactness, not
+    a promise of bit-identical selection with an algebraically expanded
+    distance formula at floating-point ties.
+
+    The CUDA extension must have been built from a source tree containing
+    ``cell_nearest_k``. Exact dense kNN remains available independently of this
+    optional optimized operation.
+    """
+    if isinstance(k, bool) or not isinstance(k, Integral):
+        raise TypeError(f"k must be an integer, got {type(k).__name__}")
+    k = int(k)
+    if not 1 <= k <= 64:
+        raise ValueError(f"k must be in [1, 64], got {k}")
+    if isinstance(max_shell, bool) or not isinstance(max_shell, Integral):
+        raise TypeError(f"max_shell must be an integer, got {type(max_shell).__name__}")
+    max_shell = int(max_shell)
+    if not 0 <= max_shell <= 64:
+        raise ValueError(f"max_shell must be in [0, 64], got {max_shell}")
+
+    native = getattr(getattr(_C, "coords", None), "cell_nearest_k", None)
+    if native is None:
+        raise RuntimeError(
+            "cell_nearest_k is unavailable in the loaded WarpConvNet extension; "
+            "rebuild the extension from the current source tree"
+        )
+
+    search = _prepare_cell_search(points, ref_offsets, queries, query_offsets, cell_size)
+    M = search.queries.shape[0]
+    device = search.points.device
+    indices = torch.empty(M, k, dtype=torch.int32, device=device)
+    squared_distances = torch.empty(M, k, dtype=torch.float32, device=device)
+    counts = torch.empty(M, dtype=torch.int32, device=device)
+    status = torch.empty(M, dtype=torch.int32, device=device)
+    visited = torch.empty(M, dtype=torch.int32, device=device)
+    result = CellNearestKResult(indices, squared_distances, counts, status, visited)
+    if M == 0:
+        return result
+
+    assert search.table is not None
+    with torch.cuda.device(device):
+        native(
+            search.points,
+            search.queries,
+            search.query_batch,
+            search.ref_offsets,
+            search.sorted_order,
+            search.cell_starts,
+            search.cell_counts,
+            search.table.keys_tensor,
+            search.table.values_tensor,
+            indices,
+            squared_distances,
+            counts,
+            status,
+            visited,
+            search.num_cells,
+            k,
+            float(cell_size),
+            max_shell,
+            search.table.capacity,
+        )
+    return result
 
 
 def voxel_block_gather(

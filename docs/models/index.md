@@ -23,6 +23,8 @@ from warpconvnet.models import (
 | Model                                           | Input                    | Task                            | Paper                          |
 | ----------------------------------------------- | ------------------------ | ------------------------------- | ------------------------------ |
 | [`PointNet`](pointnet.md)                       | Points                   | Classification / Segmentation   | Qi et al. 2017                 |
+| [`PPAT`](ppat.md)                               | Colored point cloud      | Open-vocabulary shape retrieval | Liu et al. 2023                |
+| [`Uni3D`](uni3d.md)                             | Colored point cloud      | Open-vocabulary shape retrieval | Zhou et al. 2024               |
 | [`DGCNN`](dgcnn.md)                             | Points                   | Classification / Segmentation   | Wang et al. 2019               |
 | [`PointTransformerV3`](point_transformer_v3.md) | Points (serialized)      | Segmentation                    | Wu et al. 2024                 |
 | [`MinkUNet18/34/50/101`](mink_unet.md)          | Voxels                   | Semantic segmentation           | Choy et al. 2019               |

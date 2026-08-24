@@ -45,6 +45,17 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     ),
     "build_openshape_pointbert": ("warpconvnet.models.ppat", "build_openshape_pointbert"),
     "load_openshape_pointbert": ("warpconvnet.models.ppat", "load_openshape_pointbert"),
+    # Uni3D open-vocabulary shape encoders -- see models/uni3d/.
+    "UNI3D_UP_AXIS": ("warpconvnet.models.uni3d", "UNI3D_UP_AXIS"),
+    "UNI3D_VARIANTS": ("warpconvnet.models.uni3d", "UNI3D_VARIANTS"),
+    "Uni3D": ("warpconvnet.models.uni3d", "Uni3D"),
+    "Uni3DPointEncoder": ("warpconvnet.models.uni3d", "Uni3DPointEncoder"),
+    "build_uni3d": ("warpconvnet.models.uni3d", "build_uni3d"),
+    "download_uni3d_checkpoint": (
+        "warpconvnet.models.uni3d",
+        "download_uni3d_checkpoint",
+    ),
+    "load_uni3d": ("warpconvnet.models.uni3d", "load_uni3d"),
     "PointTransformerV3": ("warpconvnet.models.point_transformer_v3", "PointTransformerV3"),
     # SpaceFormer family (backbone + instance-seg decoder) — see models/spaceformer/.
     "SpaCeFormer": ("warpconvnet.models.spaceformer", "SpaCeFormer"),

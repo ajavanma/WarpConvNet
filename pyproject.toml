@@ -75,6 +75,7 @@ include = ["warpconvnet*", "scripts*"]
 
 [tool.setuptools.package-data]
 warpconvnet = [
+    "models/uni3d/LICENSE",
     "csrc/*.cu",
     "csrc/*.cpp",
     "csrc/*.h",

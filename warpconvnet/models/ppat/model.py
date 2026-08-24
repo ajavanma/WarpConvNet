@@ -69,8 +69,10 @@ def normalize_point_cloud(
     """Center a point cloud and scale it into the unit ball.
 
     This is the preprocessing OpenShape applies before feeding a shape to the
-    encoder. Degenerate clouds (every point at the same location) collapse to
-    zeros rather than blowing up.
+    encoder. It preserves the coordinate frame: rotate XYZ to the variant's
+    ``OPENSHAPE_VARIANTS[variant]["up_axis"]`` before calling it. Degenerate
+    clouds (every point at the same location) collapse to zeros rather than
+    blowing up.
 
     Args:
         xyz: point coordinates, batched or not, with points along dim ``-2``.
@@ -1220,8 +1222,9 @@ class ProjectedPointPatchTransformer(nn.Module):
 #: Architecture and input orientation of every released OpenShape PointBERT model.
 #: ``out_dim`` is the CLIP text-encoder width the shape embedding is aligned to
 #: (``None`` = no projection head). ``up_axis`` records the gravity convention used
-#: to train that checkpoint; normalization does not rotate inputs. Checkpoint layout
-#: is detected at load time by ``_match_state_dict``.
+#: to train that checkpoint: B32 and L14 are Y-up, while bigG is Z-up.
+#: Normalization and the model forward pass do not rotate inputs. Checkpoint
+#: layout is detected at load time by ``_match_state_dict``.
 OPENSHAPE_VARIANTS: Dict[str, Dict] = {
     "openshape-pointbert-vitb32-rgb": {
         "ppat": dict(
@@ -1255,7 +1258,8 @@ def build_openshape_pointbert(
     """Instantiate a released OpenShape PointBERT architecture without weights.
 
     Args:
-        variant: key of ``OPENSHAPE_VARIANTS``.
+        variant: key of ``OPENSHAPE_VARIANTS``. It also selects the input frame:
+            Y-up for B32/L14 and Z-up for bigG. Rotate before normalization.
         in_dim: input feature channels; the released models use 6 (``xyz + rgb``).
         **kwargs: forwarded to ``PointPatchTransformer`` (e.g. ``fps_backend``,
             ``ball_query_chunk``).
@@ -1330,7 +1334,8 @@ def load_openshape_pointbert(
 
     Args:
         variant: key of ``OPENSHAPE_VARIANTS``; also selects the architecture
-            when loading a locally trained checkpoint.
+            and input frame (Y-up for B32/L14, Z-up for bigG). The loader does
+            not rotate coordinates.
         checkpoint_path: local checkpoint; downloaded from the Hub when omitted.
             Both the published layouts and plain ``model.state_dict()`` dumps work.
         device: device to move the model to.
